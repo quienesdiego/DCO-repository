@@ -1,0 +1,36 @@
+{
+  "name": "@dco-studio/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DCO Studio engine — Hono server exposing the creative-generation API. Bring your own AI/storage providers via src/adapters.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@hono/node-server": "^1.13.7",
+    "@supabase/supabase-js": "^2.49.1",
+    "culori": "^4.0.2",
+    "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
+    "gif-encoder-2": "^1.0.5",
+    "hono": "^4.7.4",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0",
+    "sharp": "^0.35.3",
+    "tesseract.js": "^7.0.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/culori": "^2.1.1",
+    "@types/jpeg-js": "^0.3.7",
+    "@types/node": "^20.14.0",
+    "@types/pngjs": "^6.0.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

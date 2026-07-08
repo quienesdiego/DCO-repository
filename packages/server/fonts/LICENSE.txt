@@ -1,0 +1,4 @@
+All fonts in this directory are licensed under the SIL Open Font License 1.1 (OFL).
+Families: Anton, Archivo Black, Bebas Neue, Barlow, Barlow Condensed.
+Source: https://github.com/google/fonts (ofl/ directory).
+Full license text: https://openfontlicense.org/open-font-license-official-text/

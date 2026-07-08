@@ -1,0 +1,15 @@
+{
+  "name": "dco-studio",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Dynamic Creative Optimization engine — AI ad-creative generation with deterministic brand-layer compositing. Bring your own AI providers, storage, and frontend integration.",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:server": "npm run dev --workspace=@dco-studio/server",
+    "build:server": "npm run build --workspace=@dco-studio/server",
+    "dev:client": "npm run dev --workspace=@dco-studio/client",
+    "build:client": "npm run build --workspace=@dco-studio/client"
+  }
+}
