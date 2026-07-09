@@ -1,34 +1,128 @@
-import React, { useState, useRef, useCallback } from 'react';
+﻿import React, { useState, useRef, useCallback } from 'react';
 import { Upload, X, Download, Loader2, CheckCircle2, AlertCircle, Sparkles, Image as ImageIcon, FileText, Table2, Check, Plus } from 'lucide-react';
 
-import type {
-    DCOStudioProps, GenStatus, BriefRow, ProfileEntry, FormatResult,
-    FixedZoneLabel, ZoneLabel, RecreateCopy,
-} from './dco-studio/types';
-import {
-    FORMATS, KV_FORMAT_OPTIONS, GPT_UNSUPPORTED_FORMATS, PROXY_FORMAT_FOR_BANNER,
-    RECREATE_FORMAT_OPTIONS, translateQaIssue,
-} from './dco-studio/constants';
-import { shadeColor, hexToRgba } from './dco-studio/color';
-import { FormatShape } from './dco-studio/FormatShape';
-import { authHeaders, resolveApiBase } from './dco-studio/api';
-import { consumeSSE, fetchWithColdStartRetry, extractErrorDetail } from './dco-studio/useSSEStream';
+const BACKEND_URL = (import.meta.env.VITE_API_URL || 'https://muse-l81e.onrender.com').trim();
+
+// Traduce los códigos internos de QA (dcoQa.ts) a una frase corta en español — antes solo
+// se veían como "STYLE_FIDELITY: 4/10" en un tooltip; un doomie no tiene por qué saber qué
+// significa eso. Hace match por prefijo porque el código real trae detalle después del ":".
+const QA_ISSUE_TRANSLATIONS: [RegExp, string][] = [
+    [/^TEXT_IN_PHOTO/i,        'La IA escribió texto en la foto (no debería) — se está regenerando.'],
+    [/^LAYOUT_LABEL_LEAK/i,    'Apareció una etiqueta interna como texto visible en la imagen.'],
+    [/^EXTRA_LIMBS/i,          'El personaje salió con más brazos o piernas de la cuenta.'],
+    [/^FINGER_DEFORMITY/i,     'Las manos/dedos salieron mal formados.'],
+    [/^FACE_ANOMALY/i,         'La cara salió con una asimetría o duplicación rara.'],
+    [/^FLOATING_LIMB/i,        'Alguna parte del cuerpo quedó flotando, sin conectar.'],
+    [/^CHARACTER_MATCH/i,      'El protagonista no se parece a la foto de referencia del personaje.'],
+    [/^STYLE_FIDELITY/i,       'La escena no se siente lo suficiente de tu marca (colores/energía gráfica débiles).'],
+    [/^CREATIVE_FRESHNESS/i,   'La escena quedó demasiado parecida al KV — se pidió más variación.'],
+    [/^QA_MODEL_ERROR/i,       'No se pudo verificar automáticamente (falla de red) — se entregó sin bloquear.'],
+];
+function translateQaIssue(issue: string): string {
+    const match = QA_ISSUE_TRANSLATIONS.find(([re]) => re.test(issue));
+    return match ? match[1] : issue;
+}
+
+const FORMATS = [
+    { id: 'feed_square',       label: 'Cuadrado',            dims: '1080×1080', platform: 'Instagram / Facebook' },
+    { id: 'feed_portrait',     label: 'Vertical (4:5)',      dims: '1080×1350', platform: 'Instagram / Facebook' },
+    { id: 'story_vertical',    label: 'Pantalla completa',   dims: '1080×1920', platform: 'Stories / Reels / TikTok' },
+    { id: 'banner_billboard',  label: 'Banner ancho',        dims: '970×250',   platform: 'Sitios web' },
+    { id: 'banner_skyscraper', label: 'Banner vertical',     dims: '160×600',   platform: 'Sitios web' },
+    { id: 'banner_halfpage',   label: 'Banner mediano',      dims: '300×600',   platform: 'Sitios web' },
+    { id: 'banner_mrec',       label: 'Banner rectangular',  dims: '300×250',   platform: 'Sitios web' },
+    { id: 'feed_landscape',    label: 'Horizontal',          dims: '1200×628',  platform: 'LinkedIn' },
+];
+
+
+// ─── Tipos ────────────────────────────────────────────────────────────────────
+type GenStatus = 'idle' | 'generating' | 'done' | 'error';
+
+interface BriefRow {
+    rowIndex: number;
+    audience: string;
+    audienciaRef: string;
+    drivers: string;
+    tono: string;
+    variante: string;
+    observaciones: string;
+    copyPreview: string;
+    copyFull: string;
+    dimensions: string;
+    formatId: string;
+    formatLabel: string;
+    platform: string;
+    campaña: string;
+    characterId?: string;
+    beneficios?: string[];
+    // Perfil visual de audiencia (ropa/casco/entorno) — solo presente cuando la fila viene
+    // del modo Automático/audiencias con IA; alimenta /recreate-formats para cambiar
+    // personaje/entorno, no aplica al flujo tradicional de Excel.
+    wardrobe?: string;
+    headwear?: string;
+    environment?: string;
+    varyScene?: boolean;
+}
+
+interface ProfileEntry {
+    id: string;
+    name: string;
+    emoji: string;
+    color: string;
+    type: 'builtin' | 'saved';
+    kvCount?: number;
+    identityPrompt?: string;
+    productCategory?: string;
+    productBenefits?: string[];
+}
+
+interface CopyData {
+    headline: string; subhead: string; vitamina_chip: string; body: string; cta: string;
+    // Beneficios como lista de bullets cortos — "body" queda como texto derivado
+    // (join de los bullets) para no romper nada que ya lea copyData.body.
+    beneficios?: string[];
+}
+
+interface FormatResult {
+    taskId: string;
+    format: string;
+    label: string;
+    audience?: string;
+    copyPreview?: string;
+    platform: string;
+    width: number;
+    height: number;
+    imageBase64: string;
+    mimeType: string;
+    status: 'waiting' | 'generating' | 'qa_check' | 'done' | 'error';
+    error?: string;
+    feedback?: 'good' | 'bad' | null;
+    feedbackComment?: string;
+    feedbackSent?: boolean;
+    sceneDesc?: string;
+    copyData?: CopyData;
+    qaAttempts?: number;
+    videoPrompt?: string;
+    gifBase64?: string;
+    qaResult?: { score: number; passed: boolean; issues: string[] } | null;
+}
+
+// ─── Helpers visuales ─────────────────────────────────────────────────────────
+// Mini preview de aspecto de formato
+const FormatShape: React.FC<{ formatId: string }> = ({ formatId }) => {
+    const shapes: Record<string, { w: number; h: number }> = {
+        feed_square: { w: 18, h: 18 }, feed_portrait: { w: 14, h: 18 }, story_vertical: { w: 10, h: 18 },
+        banner_billboard: { w: 24, h: 6 }, banner_skyscraper: { w: 6, h: 20 },
+        banner_halfpage: { w: 10, h: 18 }, banner_mrec: { w: 14, h: 10 }, feed_landscape: { w: 24, h: 13 },
+    };
+    const s = shapes[formatId] || { w: 14, h: 14 };
+    return (
+        <div style={{ width: s.w, height: s.h, borderRadius: 2, border: '1.5px solid currentColor', flexShrink: 0, opacity: 0.6 }} />
+    );
+};
 
 // ─── Componente principal ─────────────────────────────────────────────────────
-export default function DCOStudio(props: DCOStudioProps) {
-    const { apiKeyHeader, currentUserEmail } = props;
-    // Base URL del backend — configurable, sin URL de producción ajena como fallback.
-    const API_BASE = resolveApiBase(props.apiBaseUrl);
-    // Color de acento de la HERRAMIENTA (header, botones, bordes activos) — configurable
-    // vía prop, con un azul neutro por default. Todo lo que en el original era el literal
-    // "#E30613" (rojo de MUSE) repetido en decenas de estilos ahora deriva de esta única
-    // constante, para que ningún color de marca ajeno quede hardcodeado.
-    const ACCENT = props.brandColor || '#2563EB';
-    const ACCENT_LIGHT = shadeColor(ACCENT, 25);
-    const ACCENT_DARK = shadeColor(ACCENT, -20);
-    const accentA = (alpha: number) => hexToRgba(ACCENT, alpha);
-    const authedHeaders = (extra?: Record<string, string>) => authHeaders({ apiKeyHeader }, extra);
-
+export const DCOView: React.FC = () => {
     const [mode, setMode] = useState<'manual' | 'brief' | 'copys' | 'carousel' | 'auto'>('manual');
     // Por default solo se ve el flujo simple (KV → generar variantes) — Excel/brief/
     // audiencias/carrusel quedan atrás de un toggle explícito, para no abrumar a un
@@ -65,16 +159,23 @@ export default function DCOStudio(props: DCOStudioProps) {
 
     // ── Recrear con IA (outpainting del KV real vía GPT-image) — a diferencia del modo
     // Brief (foto nueva + texto por código), esto parte de la foto REAL del KV y la
-    // adapta a otro formato/audiencia (cambia texto, vestuario/accesorios/entorno del
-    // personaje), manteniendo producto/logos/layout. Resultados por pieza × formato.
+    // adapta a otro formato/audiencia (cambia texto, ropa/casco/entorno del personaje),
+    // manteniendo moto/logos/layout. Resultados por pieza × formato.
     // Todos los formatos pasan por /recreate-formats — el backend decide el proveedor
     // (GPT-image para los estándar, Gemini como respaldo para banners que GPT no soporta
     // por su límite de aspect ratio/píxeles), así que el frontend no necesita distinguir...
     // EXCEPTO cuando un banner además lleva copy/audiencia nueva: ese caso se resuelve con
-    // 2 solicitudes cortas separadas (nunca una sola conexión larga, que puede superar el
-    // timeout de un proxy en producción y dejar la pieza "cargando" para siempre):
+    // 2 solicitudes cortas separadas (nunca una sola conexión larga, que en producción
+    // superaba el timeout del proxy de Render y dejaba la pieza "cargando" para siempre):
     // paso 1 (GPT hace el cambio creativo en un formato proxy soportado) + paso 2
     // (POST /resize-with-gemini, Gemini solo extiende esa imagen ya finalizada).
+    const RECREATE_FORMAT_OPTIONS = FORMATS.map(f => f.id);
+    const PROXY_FORMAT_FOR_BANNER: Record<string, string> = {
+        banner_billboard:  'feed_landscape',
+        banner_skyscraper: 'story_vertical',
+        banner_halfpage:   'story_vertical',
+        banner_mrec:       'feed_square',
+    };
     const [recreateFormatIds, setRecreateFormatIds] = useState<string[]>(['story_vertical']);
     const [recreating, setRecreating] = useState<Record<number, boolean>>({});
     const [recreateResults, setRecreateResults] = useState<Record<number, Record<string, { status: string; imageBase64?: string; mimeType?: string; error?: string }>>>({});
@@ -89,17 +190,37 @@ export default function DCOStudio(props: DCOStudioProps) {
     // POST a /recreate-formats para UN solo formato y devuelve su resultado (o lanza con
     // el mensaje de error) — helper compartido para no repetir el parseo de SSE.
     async function runRecreateFormatsSSE(fd: FormData): Promise<{ imageBase64: string; mimeType: string }> {
-        const res = await fetch(`${API_BASE}/api/dco/recreate-formats`, { method: 'POST', headers: authedHeaders(), body: fd });
-        if (!res.ok || !res.body) throw new Error(await extractErrorDetail(res));
+        const res = await fetch(`${BACKEND_URL}/api/dco/recreate-formats`, { method: 'POST', body: fd });
+        if (!res.ok || !res.body) {
+            let errDetail = `HTTP ${res.status}`;
+            try { const j = await res.json(); errDetail = j.error || errDetail; } catch { /* ignore */ }
+            throw new Error(errDetail);
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
         let result: { imageBase64: string; mimeType: string } | null = null;
         let errorMsg: string | null = null;
-        await consumeSSE(res, ev => {
-            if (ev.type === 'result') result = { imageBase64: ev.imageBase64, mimeType: ev.mimeType };
-            if (ev.type === 'error') errorMsg = ev.error;
-        });
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const ev = JSON.parse(line.slice(6));
+                    if (ev.type === 'result') result = { imageBase64: ev.imageBase64, mimeType: ev.mimeType };
+                    if (ev.type === 'error') errorMsg = ev.error;
+                } catch { /* ignore */ }
+            }
+        }
         if (result) return result;
         throw new Error(errorMsg || 'Sin resultado');
     }
+
+    type RecreateCopy = { headline: string; subhead: string; beneficios: string[]; cta: string };
 
     // Orquesta UN formato: directo (1 solicitud) si es estándar, o si es banner sin
     // cambio creativo; 2 solicitudes separadas si es banner CON copy/audiencia nueva.
@@ -131,7 +252,7 @@ export default function DCOStudio(props: DCOStudioProps) {
             fd2.append('image', base64ToBlob(stage1.imageBase64, stage1.mimeType), 'proxy.png');
             fd2.append('width', String(tw));
             fd2.append('height', String(th));
-            const res2 = await fetch(`${API_BASE}/api/dco/resize-with-gemini`, { method: 'POST', headers: authedHeaders(), body: fd2 });
+            const res2 = await fetch(`${BACKEND_URL}/api/dco/resize-with-gemini`, { method: 'POST', body: fd2 });
             const data2 = await res2.json();
             if (!res2.ok) throw new Error(data2.error || 'Error en el paso 2 (Gemini)');
             return { imageBase64: data2.imageBase64, mimeType: data2.mimeType };
@@ -181,10 +302,10 @@ export default function DCOStudio(props: DCOStudioProps) {
     const [conglomerateLogoFile, setConglomerateLogoFile]       = useState<File | null>(null);
     const [conglomerateLogoPreview, setConglomerateLogoPreview] = useState<string>('');
     // Badges/sellos adicionales (opcional, cualquier cantidad) — genérico para CUALQUIER
-    // marca: badge de fabricante, íconos de cumplimiento, sello de certificación, etc.
-    // Mismo patrón que logo/conglomerado: imagen dedicada que se compone fiel, nunca
-    // reinventada por la IA. Se manda al backend como extraLogoImage (uno por badge) +
-    // su zona extra_logo_N marcada a mano.
+    // marca: badge de fabricante ("Preferida en 100 países"), íconos de cumplimiento
+    // (CBS/ABS/luces), sello de certificación, etc. Mismo patrón que logo/conglomerado:
+    // imagen dedicada que se compone fiel, nunca reinventada por la IA. Se manda al
+    // backend como extraLogoImage (uno por badge) + su zona extra_logo_N marcada a mano.
     const [extraBadges, setExtraBadges] = useState<{ file: File; preview: string; name: string }[]>([]);
     const addExtraBadge = (file: File, name: string) => {
         const reader = new FileReader();
@@ -195,12 +316,12 @@ export default function DCOStudio(props: DCOStudioProps) {
     const [isDraggingKv, setIsDraggingKv] = useState(false);
     const kvInputRef = useRef<HTMLInputElement>(null);
 
-    // Cargar perfiles desde API al montar — con 1 reintento porque el backend puede
-    // estar en cold start (dormido) justo cuando se abre la vista; sin esto, el selector
-    // de "Perfiles de marca" queda vacío sin ningún indicio de error.
+    // Cargar perfiles desde API al montar — con 1 reintento porque el backend (Render
+    // free/cheap tier) puede estar en cold start (dormido) justo cuando se abre la vista;
+    // sin esto, el selector de "Perfiles de marca" queda vacío sin ningún indicio de error.
     React.useEffect(() => {
         const load = (timeoutMs: number): Promise<any> =>
-            fetch(`${API_BASE}/api/dco/profiles`, { headers: authedHeaders(), signal: AbortSignal.timeout(timeoutMs) }).then(r => r.json());
+            fetch(`${BACKEND_URL}/api/dco/profiles`, { signal: AbortSignal.timeout(timeoutMs) }).then(r => r.json());
         load(10000)
             .then(d => { if (d.profiles) setProfiles(d.profiles); })
             .catch(() => {
@@ -225,7 +346,7 @@ export default function DCOStudio(props: DCOStudioProps) {
 
     React.useEffect(() => {
         const load = (timeoutMs: number): Promise<any> =>
-            fetch(`${API_BASE}/api/dco/characters`, { headers: authedHeaders(), signal: AbortSignal.timeout(timeoutMs) }).then(r => r.json());
+            fetch(`${BACKEND_URL}/api/dco/characters`, { signal: AbortSignal.timeout(timeoutMs) }).then(r => r.json());
         load(10000)
             .then(d => { if (d.characters) setCharacters(d.characters); })
             .catch(() => {
@@ -241,6 +362,13 @@ export default function DCOStudio(props: DCOStudioProps) {
     const [learnFiles, setLearnFiles]     = useState<File[]>([]);
     // Formato de cada KV subido (uno por archivo) — evita mezclar layout de formatos distintos
     const [learnFileFormats, setLearnFileFormats] = useState<string[]>([]);
+    const KV_FORMAT_OPTIONS = [
+        { value: 'square',   label: 'Cuadrado' },
+        { value: 'portrait', label: 'Vertical 4:5' },
+        { value: 'vertical', label: 'Story/Reels' },
+        { value: 'banner',   label: 'Banner' },
+        { value: 'general',  label: 'Sin especificar' },
+    ];
     const [learnAnalysis, setLearnAnalysis] = useState<any>(null);
     const [newProfileName,  setNewProfileName]  = useState('');
     const [newProfileEmoji, setNewProfileEmoji] = useState('🏷️');
@@ -255,9 +383,10 @@ export default function DCOStudio(props: DCOStudioProps) {
     // GPT-image no soporta los formatos banner (excede su límite de aspect ratio 3:1 y su
     // mínimo de píxeles totales) — se filtran solos si están seleccionados al cambiar a GPT.
     const [imageProvider, setImageProvider] = useState<'gemini' | 'gpt'>('gemini');
+    const GPT_UNSUPPORTED_FORMATS = ['banner_billboard', 'banner_skyscraper', 'banner_halfpage', 'banner_mrec'];
     const updateCopy = (field: string, value: string) => { setManualCopy(prev => ({ ...prev, [field]: value })); setResults([]); setGenStatus('idle'); };
-    // Beneficios como lista de bullets cortos (ej. "+Rápido +Fácil +Seguro"), no un
-    // párrafo único — el KV de referencia puede traer 1, 3, o la cantidad que sea.
+    // Beneficios como lista de bullets cortos (ej. "+Oportunidades +Movimiento +Ingresos"),
+    // no un párrafo único — el KV de referencia puede traer 1, 3, o la cantidad que sea.
     const [benefits, setBenefits] = useState<string[]>(['']);
     const updateBenefit = (i: number, value: string) => { setBenefits(prev => prev.map((b, idx) => idx === i ? value : b)); setResults([]); setGenStatus('idle'); };
     const addBenefit = () => setBenefits(prev => prev.length >= 6 ? prev : [...prev, '']);
@@ -288,13 +417,18 @@ export default function DCOStudio(props: DCOStudioProps) {
     // dibuja la caja directamente sobre la imagen de referencia y esa posición exacta
     // (en % del ancho/alto, no depende del tamaño en pantalla) se manda al backend para
     // que la respete en vez de inventar una zona propia.
-    // TODO: drag-to-draw zone creation is not implemented, matching upstream. Zones are
-    // only populated automatically by the "Learn brand" flow's proposedZones response,
-    // or left empty (fully automatic placement by the backend). Only removal (X) exists.
+    // Nota: "body"/Beneficios único ya no es una zona fija — ahora son N zonas
+    // "benefit_1".."benefit_N" (una por cada bullet corto, ver estado `benefits`
+    // más arriba), porque un KV real trae 1, 3, o la cantidad que sea de beneficios
+    // como bullets separados (ej. "+Oportunidades +Movimiento +Ingresos"), no un
+    // párrafo único.
+    type FixedZoneLabel = 'headline' | 'subhead' | 'vitamina_chip' | 'cta'
+        | 'logo' | 'brand_name' | 'conglomerate_logo' | 'character';
+    type ZoneLabel = FixedZoneLabel | string; // string cubre "benefit_1", "benefit_2", ...
     const FIXED_ZONE_LABELS: { key: FixedZoneLabel; name: string; color: string }[] = [
-        { key: 'headline',          name: 'Copy principal',      color: ACCENT },
+        { key: 'headline',          name: 'Copy principal',      color: '#E30613' },
         { key: 'subhead',           name: 'Copy secundario',      color: '#2563eb' },
-        { key: 'chip',              name: 'Chip/Badge',           color: '#f59e0b' },
+        { key: 'vitamina_chip',     name: 'Chip/Badge',           color: '#f59e0b' },
         { key: 'cta',               name: 'CTA',                  color: '#9333ea' },
         { key: 'logo',              name: 'Logo de marca',        color: '#0891b2' },
         { key: 'brand_name',        name: 'Nombre de marca (si no subiste logo)', color: '#db2777' },
@@ -361,7 +495,7 @@ export default function DCOStudio(props: DCOStudioProps) {
         setBriefLoading(true); setBriefError(''); setBriefRows([]); setSelectedRows(new Set()); setRowFormatOverrides({});
         const fd = new FormData(); fd.append('brief', file);
         try {
-            const res  = await fetch(`${API_BASE}/api/dco/parse-brief`, { method: 'POST', headers: authedHeaders(), body: fd, signal: AbortSignal.timeout(90000) });
+            const res  = await fetch(`${BACKEND_URL}/api/dco/parse-brief`, { method: 'POST', body: fd, signal: AbortSignal.timeout(90000) });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || 'Error al parsear');
             const pieces: BriefRow[] = data.pieces || [];
@@ -419,7 +553,7 @@ export default function DCOStudio(props: DCOStudioProps) {
         fd.append('rows', JSON.stringify(doneIndices));
         fd.append('videoPrompts', JSON.stringify(videoPromptsMap));
         try {
-            const res  = await fetch(`${API_BASE}/api/dco/export-brief`, { method: 'POST', headers: authedHeaders(), body: fd, signal: AbortSignal.timeout(30000) });
+            const res  = await fetch(`${BACKEND_URL}/api/dco/export-brief`, { method: 'POST', body: fd, signal: AbortSignal.timeout(30000) });
             if (!res.ok) throw new Error(`Backend respondió ${res.status}`);
             const blob = await res.blob();
             const url  = URL.createObjectURL(blob);
@@ -455,7 +589,7 @@ export default function DCOStudio(props: DCOStudioProps) {
             fd.append('refHeight', String(refH));
         }
         try {
-            const res  = await fetch(`${API_BASE}/api/dco/generate-copies`, { method: 'POST', headers: authedHeaders(), body: fd, signal: AbortSignal.timeout(90000) });
+            const res  = await fetch(`${BACKEND_URL}/api/dco/generate-copies`, { method: 'POST', body: fd, signal: AbortSignal.timeout(90000) });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || 'Error generando copys');
             setCopyIdentity(data.identity || null);
@@ -482,9 +616,9 @@ export default function DCOStudio(props: DCOStudioProps) {
         const refFmt = FORMATS.find(f => f.id === manualFormats[0]) || FORMATS[0];
         const [refW, refH] = refFmt.dims.split('×').map(s => parseInt(s.replace(/\D/g, '')));
         try {
-            const res = await fetch(`${API_BASE}/api/dco/generate-copies-from-audiences`, {
+            const res = await fetch(`${BACKEND_URL}/api/dco/generate-copies-from-audiences`, {
                 method: 'POST',
-                headers: authedHeaders({ 'Content-Type': 'application/json' }),
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     profileId: brandProfile,
                     audiences: filled,
@@ -518,7 +652,7 @@ export default function DCOStudio(props: DCOStudioProps) {
         fd.append('count', '3');
         if (selectedProductCategory) fd.append('productCategory', selectedProductCategory);
         try {
-            const res = await fetch(`${API_BASE}/api/dco/suggest-audiences`, { method: 'POST', headers: authedHeaders(), body: fd, signal: AbortSignal.timeout(60000) });
+            const res = await fetch(`${BACKEND_URL}/api/dco/suggest-audiences`, { method: 'POST', body: fd, signal: AbortSignal.timeout(60000) });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || 'Error sugiriendo audiencias');
             if (Array.isArray(data.audiences) && data.audiences.length) {
@@ -548,7 +682,7 @@ export default function DCOStudio(props: DCOStudioProps) {
             fd.append('count', String(autoAudienceCount));
             if (selectedProductCategory) fd.append('productCategory', selectedProductCategory);
             if (autoBusinessContext.trim()) fd.append('businessContext', autoBusinessContext.trim());
-            const res1 = await fetch(`${API_BASE}/api/dco/suggest-audiences`, { method: 'POST', headers: authedHeaders(), body: fd, signal: AbortSignal.timeout(60000) });
+            const res1 = await fetch(`${BACKEND_URL}/api/dco/suggest-audiences`, { method: 'POST', body: fd, signal: AbortSignal.timeout(60000) });
             const data1 = await res1.json();
             if (!res1.ok) throw new Error(data1.error || 'Error sugiriendo audiencias');
             const audiences = (Array.isArray(data1.audiences) ? data1.audiences : []).map((a: any) => ({
@@ -559,9 +693,9 @@ export default function DCOStudio(props: DCOStudioProps) {
             setAudienceList(audiences);
 
             const kvMatch = kvPreview.match(/^data:(.+);base64,(.+)$/);
-            const res2 = await fetch(`${API_BASE}/api/dco/generate-copies-from-audiences`, {
+            const res2 = await fetch(`${BACKEND_URL}/api/dco/generate-copies-from-audiences`, {
                 method: 'POST',
-                headers: authedHeaders({ 'Content-Type': 'application/json' }),
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     profileId: brandProfile,
                     audiences,
@@ -587,8 +721,8 @@ export default function DCOStudio(props: DCOStudioProps) {
     const downloadCuadro = async () => {
         if (!copyPieces.length) return;
         try {
-            const res = await fetch(`${API_BASE}/api/dco/export-cuadro`, {
-                method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }),
+            const res = await fetch(`${BACKEND_URL}/api/dco/export-cuadro`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ pieces: copyPieces, meta: { marca: copyIdentity?.marca || 'MARCA' } }),
                 signal: AbortSignal.timeout(30000),
             });
@@ -664,7 +798,7 @@ export default function DCOStudio(props: DCOStudioProps) {
     });
 
     // Corre `worker` sobre `items` con un máximo de `limit` en simultáneo — mismo criterio
-    // de concurrencia acotada que ya usa el backend para no saturar la API del proveedor de IA.
+    // de concurrencia acotada que ya usa el backend para no saturar la API de OpenAI.
     async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T) => Promise<void>) {
         let idx = 0;
         const next = async (): Promise<void> => {
@@ -733,22 +867,41 @@ export default function DCOStudio(props: DCOStudioProps) {
         if (selectedProductCategory) fd.append('productCategory', selectedProductCategory);
         if (selectedProductBenefits.length > 0) fd.append('productBenefits', JSON.stringify(selectedProductBenefits));
 
-        const res = await fetchWithColdStartRetry(`${API_BASE}/api/dco/generate`, { method: 'POST', headers: authedHeaders(), body: fd });
+        let res = await fetch(`${BACKEND_URL}/api/dco/generate`, { method: 'POST', body: fd });
+        if (res.status === 502 || res.status === 503) {
+            await new Promise(r => setTimeout(r, 8000));
+            res = await fetch(`${BACKEND_URL}/api/dco/generate`, { method: 'POST', body: fd });
+        }
         if (!res.ok || !res.body) {
-            const errDetail = await extractErrorDetail(res);
+            let errDetail = `HTTP ${res.status}`;
+            try { const j = await res.json(); errDetail = j.error || errDetail; } catch {}
             rows.forEach(r => {
                 const taskId = `row_${r.rowIndex}${r.variante ? `_v${r.variante}` : ''}`;
                 setResults(prev => prev.map(x => x.taskId === taskId ? { ...x, status: 'error', error: errDetail } : x));
             });
             return;
         }
-        await consumeSSE(res, ev => {
-            if (ev.type === 'start')  setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'generating', sceneDesc: ev.sceneDesc, copyData: ev.copy } : r));
-            if (ev.type === 'qa_retry') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'qa_check' } : r));
-            if (ev.type === 'qa_score') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, qaResult: { score: ev.score, passed: ev.passed, issues: ev.errors || [] } } : r));
-            if (ev.type === 'result') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'done', imageBase64: ev.imageBase64, mimeType: ev.mimeType, width: ev.width, height: ev.height, qaAttempts: ev.qaAttempts, videoPrompt: ev.videoPrompt, gifBase64: ev.gifBase64 } : r));
-            if (ev.type === 'error') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'error', error: ev.error } : r));
-        });
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const ev = JSON.parse(line.slice(6));
+                    if (ev.type === 'start')  setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'generating', sceneDesc: ev.sceneDesc, copyData: ev.copy } : r));
+                    if (ev.type === 'qa_retry') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'qa_check' } : r));
+                    if (ev.type === 'qa_score') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, qaResult: { score: ev.score, passed: ev.passed, issues: ev.errors || [] } } : r));
+                    if (ev.type === 'result') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'done', imageBase64: ev.imageBase64, mimeType: ev.mimeType, width: ev.width, height: ev.height, qaAttempts: ev.qaAttempts, videoPrompt: ev.videoPrompt, gifBase64: ev.gifBase64 } : r));
+                    if (ev.type === 'error') setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'error', error: ev.error } : r));
+                } catch { /* ignore */ }
+            }
+        }
     };
 
     // ─── Generación ───────────────────────────────────────────────────────────
@@ -813,7 +966,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                 label: `${fmt.label} · ${fmt.dims}`,
                 platform: fmt.platform,
                 sceneDesc: manualCopy.sceneDesc,
-                copyData: { headline: manualCopy.headline, subhead: manualCopy.subhead, chip: manualCopy.chip, body: benefits.filter(Boolean).join(' · '), cta: manualCopy.cta, beneficios: benefits.filter(Boolean) },
+                copyData: { headline: manualCopy.headline, subhead: manualCopy.subhead, vitamina_chip: manualCopy.chip, body: benefits.filter(Boolean).join(' · '), cta: manualCopy.cta, beneficios: benefits.filter(Boolean) },
                 width: 0, height: 0, imageBase64: '', mimeType: '',
                 status: 'waiting' as const,
             };
@@ -836,23 +989,42 @@ export default function DCOStudio(props: DCOStudioProps) {
 
         try {
             setServerMsg('Conectando...');
-            let res = await fetch(`${API_BASE}/api/dco/generate`, { method: 'POST', headers: authedHeaders(), body: fd });
+            let res = await fetch(`${BACKEND_URL}/api/dco/generate`, { method: 'POST', body: fd });
             if (res.status === 502 || res.status === 503) {
-                setServerMsg('⏳ Servidor despertando — espera ~60s...');
+                setServerMsg('⏳ Servidor despertando — espera ~60s (Render free tier)...');
                 await new Promise(r => setTimeout(r, 8000));
-                res = await fetch(`${API_BASE}/api/dco/generate`, { method: 'POST', headers: authedHeaders(), body: fd });
+                res = await fetch(`${BACKEND_URL}/api/dco/generate`, { method: 'POST', body: fd });
             }
-            if (!res.ok || !res.body) throw new Error(await extractErrorDetail(res));
+            if (!res.ok || !res.body) {
+                let errDetail = `HTTP ${res.status}`;
+                try { const j = await res.json(); errDetail = j.error || errDetail; } catch {}
+                throw new Error(errDetail);
+            }
             setServerMsg('');
 
-            await consumeSSE(res, ev => {
-                if (ev.type === 'start')     setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'generating', sceneDesc: ev.sceneDesc, copyData: ev.copy } : r));
-                if (ev.type === 'qa_retry')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'qa_check' } : r));
-                if (ev.type === 'qa_score')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, qaResult: { score: ev.score, passed: ev.passed, issues: ev.errors || [] } } : r));
-                if (ev.type === 'result')              setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'done', imageBase64: ev.imageBase64, mimeType: ev.mimeType, width: ev.width, height: ev.height, qaAttempts: ev.qaAttempts, videoPrompt: ev.videoPrompt, gifBase64: ev.gifBase64 } : r));
-                if (ev.type === 'error')               setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'error', error: ev.error } : r));
-                if (ev.type === 'done')                setGenStatus('done');
-            });
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const ev = JSON.parse(line.slice(6));
+                        if (ev.type === 'start')     setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'generating', sceneDesc: ev.sceneDesc, copyData: ev.copy } : r));
+                        if (ev.type === 'qa_retry')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'qa_check' } : r));
+                        if (ev.type === 'qa_score')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, qaResult: { score: ev.score, passed: ev.passed, issues: ev.errors || [] } } : r));
+                        if (ev.type === 'result')              setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'done', imageBase64: ev.imageBase64, mimeType: ev.mimeType, width: ev.width, height: ev.height, qaAttempts: ev.qaAttempts, videoPrompt: ev.videoPrompt, gifBase64: ev.gifBase64 } : r));
+                        if (ev.type === 'error')               setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'error', error: ev.error } : r));
+                        if (ev.type === 'done')                setGenStatus('done');
+                    } catch { /* ignore */ }
+                }
+            }
             // Stream closed sin evento 'done' — limpiar tarjetas atascadas
             setGenStatus(prev => prev === 'generating' ? 'done' : prev);
             setResults(prev => prev.map(r => ['waiting', 'generating', 'qa_check'].includes(r.status) ? { ...r, status: 'error', error: 'Conexión cortada — reintenta' } : r));
@@ -880,16 +1052,30 @@ export default function DCOStudio(props: DCOStudioProps) {
         if (logoFile) fd.append('logoImage', logoFile);
 
         try {
-            const res = await fetch(`${API_BASE}/api/dco/generate-carousel`, { method: 'POST', headers: authedHeaders(), body: fd });
+            const res = await fetch(`${BACKEND_URL}/api/dco/generate-carousel`, { method: 'POST', body: fd });
             if (!res.ok || !res.body) throw new Error('Error al iniciar el carrusel');
-            await consumeSSE(res, ev => {
-                if (ev.type === 'story_start') setCarouselBeats(ev.beats);
-                if (ev.type === 'slide_start') setCarouselSlides(prev => ({ ...prev, [ev.index]: { imageBase64: '', mimeType: '', score: 0, status: 'generating' } }));
-                if (ev.type === 'slide_done') setCarouselSlides(prev => ({ ...prev, [ev.index]: { imageBase64: ev.imageBase64, mimeType: ev.mimeType, score: ev.score, status: 'done' } }));
-                if (ev.type === 'slide_error') setCarouselSlides(prev => ({ ...prev, [ev.index]: { imageBase64: '', mimeType: '', score: 0, status: 'error' } }));
-                if (ev.type === 'done') setCarouselStatus('done');
-                if (ev.type === 'error') { setCarouselStatus('error'); setCarouselError(ev.error || 'Error'); }
-            });
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const ev = JSON.parse(line.slice(6));
+                        if (ev.type === 'story_start') setCarouselBeats(ev.beats);
+                        if (ev.type === 'slide_start') setCarouselSlides(prev => ({ ...prev, [ev.index]: { imageBase64: '', mimeType: '', score: 0, status: 'generating' } }));
+                        if (ev.type === 'slide_done') setCarouselSlides(prev => ({ ...prev, [ev.index]: { imageBase64: ev.imageBase64, mimeType: ev.mimeType, score: ev.score, status: 'done' } }));
+                        if (ev.type === 'slide_error') setCarouselSlides(prev => ({ ...prev, [ev.index]: { imageBase64: '', mimeType: '', score: 0, status: 'error' } }));
+                        if (ev.type === 'done') setCarouselStatus('done');
+                        if (ev.type === 'error') { setCarouselStatus('error'); setCarouselError(ev.error || 'Error'); }
+                    } catch { /* ignore */ }
+                }
+            }
             setCarouselStatus(prev => prev === 'generating' ? 'done' : prev);
         } catch (err: any) {
             setCarouselStatus('error');
@@ -914,11 +1100,11 @@ export default function DCOStudio(props: DCOStudioProps) {
     const sendFeedback = async (item: FormatResult, rating: 'good' | 'bad', comment = '') => {
         setResults(prev => prev.map(r => r.taskId === item.taskId ? { ...r, feedback: rating, feedbackComment: comment } : r));
         try {
-            // Email del usuario logueado provisto por el host — sin leer localStorage directamente.
-            const userEmail = currentUserEmail || '';
-            await fetch(`${API_BASE}/api/dco/feedback`, {
+            const stored = localStorage.getItem('muse_user');
+            const userEmail = stored ? JSON.parse(stored).email : '';
+            await fetch(`${BACKEND_URL}/api/dco/feedback`, {
                 method: 'POST',
-                headers: authedHeaders({ 'Content-Type': 'application/json' }),
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     profileId: brandProfile, formatId: item.format,
                     audience: item.audience || '', headline: item.label,
@@ -929,7 +1115,7 @@ export default function DCOStudio(props: DCOStudioProps) {
         } catch { /* silent */ }
     };
 
-    const retouchItem = async (item: FormatResult, correction: string) => {
+    const retouchItem = async (item, correction) => {
         if (!kvFile || !item.imageBase64) return;
         setResults(prev => prev.map(r => r.taskId === item.taskId ? { ...r, status: 'generating', feedback: null } : r));
         try {
@@ -940,7 +1126,7 @@ export default function DCOStudio(props: DCOStudioProps) {
             fd.append('correction',          correction);
             fd.append('formatId',            item.format);
             fd.append('profileId',           brandProfile);
-            const res  = await fetch(API_BASE + '/api/dco/retouch', { method: 'POST', headers: authedHeaders(), body: fd, signal: AbortSignal.timeout(90000) });
+            const res  = await fetch(BACKEND_URL + '/api/dco/retouch', { method: 'POST', body: fd, signal: AbortSignal.timeout(90000) });
             const data = await res.json();
             if (!res.ok || data.error) throw new Error(data.error || 'Error en retouch');
             setResults(prev => prev.map(r => r.taskId === item.taskId ? {
@@ -984,15 +1170,29 @@ export default function DCOStudio(props: DCOStudioProps) {
             explicitSceneDesc: item.sceneDesc, explicitCopy: item.copyData,
         }]));
         try {
-            const res = await fetch(`${API_BASE}/api/dco/generate`, { method: 'POST', headers: authedHeaders(), body: fd });
+            const res = await fetch(`${BACKEND_URL}/api/dco/generate`, { method: 'POST', body: fd });
             if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-            await consumeSSE(res, ev => {
-                if (ev.type === 'start')    setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'generating' } : r));
-                if (ev.type === 'qa_retry')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'qa_check' } : r));
-                if (ev.type === 'qa_score')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, qaResult: { score: ev.score, passed: ev.passed, issues: ev.errors || [] } } : r));
-                if (ev.type === 'result')            setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'done', imageBase64: ev.imageBase64, mimeType: ev.mimeType, width: ev.width, height: ev.height, qaAttempts: ev.qaAttempts } : r));
-                if (ev.type === 'error')             setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'error', error: ev.error } : r));
-            });
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        const ev = JSON.parse(line.slice(6));
+                        if (ev.type === 'start')    setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'generating' } : r));
+                        if (ev.type === 'qa_retry')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'qa_check' } : r));
+                        if (ev.type === 'qa_score')          setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, qaResult: { score: ev.score, passed: ev.passed, issues: ev.errors || [] } } : r));
+                        if (ev.type === 'result')            setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'done', imageBase64: ev.imageBase64, mimeType: ev.mimeType, width: ev.width, height: ev.height, qaAttempts: ev.qaAttempts } : r));
+                        if (ev.type === 'error')             setResults(prev => prev.map(r => r.taskId === ev.taskId ? { ...r, status: 'error', error: ev.error } : r));
+                    } catch { }
+                }
+            }
         } catch (err: any) {
             setResults(prev => prev.map(r => r.taskId === newTaskId ? { ...r, status: 'error', error: err.message } : r));
         }
@@ -1007,11 +1207,11 @@ export default function DCOStudio(props: DCOStudioProps) {
             {/* ── Header ──────────────────────────────────────────────────── */}
             <div style={{ borderBottom: '1px solid var(--z-border)', padding: '0.875rem 1.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'var(--z-surface)', flexShrink: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                    <div style={{ width: 34, height: 34, borderRadius: 9, background: `linear-gradient(135deg, ${ACCENT}, ${ACCENT_LIGHT})`, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div style={{ width: 34, height: 34, borderRadius: 9, background: 'linear-gradient(135deg, #E30613, #ff4d4d)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                         <Sparkles size={17} color="#fff" />
                     </div>
                     <div>
-                        <div style={{ fontWeight: 800, fontSize: '1rem', letterSpacing: '0.04em', textTransform: 'uppercase' }}>DCO Studio</div>
+                        <div style={{ fontWeight: 800, fontSize: '1rem', letterSpacing: '0.04em', textTransform: 'uppercase' }}>DCO Muse</div>
                         <div style={{ fontSize: '0.68rem', color: 'var(--z-text-muted)', letterSpacing: '0.05em' }}>Generador de creatividades · IA</div>
                     </div>
                 </div>
@@ -1022,7 +1222,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                         </button>
                     )}
                     {doneCount > 0 && (
-                        <button onClick={downloadAll} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 1rem', background: ACCENT, color: '#fff', border: 'none', borderRadius: 7, fontSize: '0.75rem', fontWeight: 700, cursor: 'pointer', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                        <button onClick={downloadAll} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 1rem', background: '#E30613', color: '#fff', border: 'none', borderRadius: 7, fontSize: '0.75rem', fontWeight: 700, cursor: 'pointer', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
                             <Download size={13} /> Descargar todo ({doneCount})
                         </button>
                     )}
@@ -1044,13 +1244,13 @@ export default function DCOStudio(props: DCOStudioProps) {
                             disabled={!canGenerate}
                             style={{
                                 width: '100%', padding: '0.85rem', borderRadius: 10, border: 'none',
-                                background: !canGenerate ? 'var(--z-border)' : `linear-gradient(135deg, ${ACCENT}, ${ACCENT_DARK})`,
+                                background: !canGenerate ? 'var(--z-border)' : 'linear-gradient(135deg, #E30613, #c00010)',
                                 color: !canGenerate ? 'var(--z-text-muted)' : '#fff',
                                 fontWeight: 800, fontSize: '0.88rem', letterSpacing: '0.06em', textTransform: 'uppercase',
                                 cursor: !canGenerate ? 'not-allowed' : 'pointer',
                                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.6rem',
                                 transition: 'all 0.2s',
-                                boxShadow: canGenerate ? `0 4px 16px ${accentA(0.35)}` : 'none',
+                                boxShadow: canGenerate ? '0 4px 16px rgba(227,6,19,0.35)' : 'none',
                             }}>
                             {genStatus === 'generating'
                                 ? <><Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} /> Generando {doneCount}/{results.length}...</>
@@ -1066,7 +1266,7 @@ export default function DCOStudio(props: DCOStudioProps) {
 
                     {selectedCount > 15 && genStatus !== 'generating' && (
                         <div style={{ padding: '0.45rem 1.25rem', background: 'rgba(245,158,11,0.12)', borderBottom: '1px solid rgba(245,158,11,0.3)', fontSize: '0.68rem', color: '#f59e0b', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                            ⚠️ Recomendado máx. 15 piezas por sesión. Con {selectedCount} puede haber timeout en backends de free tier.
+                            ⚠️ Recomendado máx. 15 piezas por sesión. Con {selectedCount} puede haber timeout en Render free.
                         </div>
                     )}
                     {/* Scroll area */}
@@ -1095,8 +1295,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     onDragOver={e => e.preventDefault()}
                                     onDrop={onKvDrop}
                                     onClick={() => kvInputRef.current?.click()}
-                                    style={{ border: `2px dashed ${isDraggingKv ? ACCENT : 'var(--z-border-strong)'}`, borderRadius: 10, padding: '2rem 1rem', textAlign: 'center', cursor: 'pointer', background: isDraggingKv ? accentA(0.05) : 'var(--z-bg)', transition: 'all 0.18s' }}>
-                                    <Upload size={28} color={isDraggingKv ? ACCENT : 'var(--z-text-muted)'} style={{ margin: '0 auto 0.6rem' }} />
+                                    style={{ border: `2px dashed ${isDraggingKv ? '#E30613' : 'var(--z-border-strong)'}`, borderRadius: 10, padding: '2rem 1rem', textAlign: 'center', cursor: 'pointer', background: isDraggingKv ? 'rgba(227,6,19,0.05)' : 'var(--z-bg)', transition: 'all 0.18s' }}>
+                                    <Upload size={28} color={isDraggingKv ? '#E30613' : 'var(--z-text-muted)'} style={{ margin: '0 auto 0.6rem' }} />
                                     <div style={{ fontSize: '0.9rem', fontWeight: 700, color: 'var(--z-text-secondary)', marginBottom: '0.25rem' }}>Sube el KV de referencia</div>
                                     <div style={{ fontSize: '0.72rem', color: 'var(--z-text-muted)' }}>Arrastra aquí o haz clic · JPG, PNG</div>
                                 </div>
@@ -1281,7 +1481,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     inp.type = 'file'; inp.accept = 'image/*';
                                     inp.onchange = (e: any) => {
                                         const f = e.target.files?.[0]; if (!f) return;
-                                        const name = window.prompt('Nombre del badge (ej: "Certificación de calidad", "Íconos de cumplimiento")', `Badge ${extraBadges.length + 1}`) || `Badge ${extraBadges.length + 1}`;
+                                        const name = window.prompt('Nombre del badge (ej: "Bajaj — Preferida en 100 países", "Íconos de cumplimiento")', `Badge ${extraBadges.length + 1}`) || `Badge ${extraBadges.length + 1}`;
                                         addExtraBadge(f, name);
                                     };
                                     inp.click();
@@ -1318,7 +1518,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                             <button onClick={async () => {
                                                 if (!confirm(`¿Eliminar perfil "${p.name}"?`)) return;
                                                 try {
-                                                    const res = await fetch(`${API_BASE}/api/dco/profiles/${p.id}`, { method: 'DELETE', headers: authedHeaders(), signal: AbortSignal.timeout(15000) });
+                                                    const res = await fetch(`${BACKEND_URL}/api/dco/profiles/${p.id}`, { method: 'DELETE', signal: AbortSignal.timeout(15000) });
                                                     if (!res.ok) throw new Error(`Backend respondió ${res.status}`);
                                                     setProfiles(prev => prev.filter(x => x.id !== p.id));
                                                     if (brandProfile === p.id) { setBrandProfile('generic'); setSelectedProfileIdentity(undefined); }
@@ -1357,7 +1557,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         <button onClick={async () => {
                                             if (!confirm(`¿Eliminar personaje "${ch.name}"?`)) return;
                                             try {
-                                                const res = await fetch(`${API_BASE}/api/dco/characters/${ch.id}`, { method: 'DELETE', headers: authedHeaders(), signal: AbortSignal.timeout(15000) });
+                                                const res = await fetch(`${BACKEND_URL}/api/dco/characters/${ch.id}`, { method: 'DELETE', signal: AbortSignal.timeout(15000) });
                                                 if (!res.ok) throw new Error(`Backend respondió ${res.status}`);
                                                 setCharacters(prev => prev.filter(x => x.id !== ch.id));
                                                 if (characterId === ch.id) setCharacterId('');
@@ -1379,7 +1579,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                             <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
                                 <div style={{ background: 'var(--z-bg)', border: '1px solid var(--z-border)', borderRadius: 12, padding: '1.5rem', width: 380, maxWidth: '90vw' }}>
                                     <div style={{ fontSize: '0.95rem', fontWeight: 700, marginBottom: '1rem', color: 'var(--z-text)' }}>Nuevo personaje</div>
-                                    <input value={newCharacterName} onChange={e => setNewCharacterName(e.target.value)} placeholder="Nombre (ej: Personaje principal, Vocero oficial)"
+                                    <input value={newCharacterName} onChange={e => setNewCharacterName(e.target.value)} placeholder="Nombre (ej: Ana, Vocero oficial)"
                                         style={{ width: '100%', padding: '0.6rem 0.8rem', borderRadius: 8, border: '1px solid var(--z-border)', background: 'var(--z-bg-secondary)', color: 'var(--z-text)', fontSize: '0.8rem', marginBottom: '0.8rem' }} />
                                     <div onClick={() => {
                                         const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*';
@@ -1403,7 +1603,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                 const fd = new FormData();
                                                 fd.append('name', newCharacterName.trim());
                                                 fd.append('photo', newCharacterFile);
-                                                const res = await fetch(`${API_BASE}/api/dco/characters`, { method: 'POST', headers: authedHeaders(), body: fd });
+                                                const res = await fetch(`${BACKEND_URL}/api/dco/characters`, { method: 'POST', body: fd });
                                                 const data = await res.json();
                                                 if (data.character) {
                                                     setCharacters(prev => [data.character, ...prev]);
@@ -1437,7 +1637,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     {learnStep === 'upload' && (
                                         <>
                                             <p style={{ fontSize: '0.75rem', color: 'var(--z-text-secondary)', marginBottom: '1rem', lineHeight: 1.5 }}>
-                                                Sube entre 5 y 20 KVs finales de la marca. El sistema los analizará para extraer colores, tipografía, layout, estructura de copy y todos los elementos visuales de identidad.
+                                                Sube entre 5 y 20 KVs finales de la marca. Gemini los analizará para extraer colores, tipografía, layout, estructura de copy y todos los elementos visuales de identidad.
                                             </p>
                                             <div
                                                 onClick={() => learnInputRef.current?.click()}
@@ -1477,11 +1677,11 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                         const fd = new FormData();
                                                         learnFiles.forEach(f => fd.append('kvImages', f));
                                                         learnFileFormats.forEach(fmt => fd.append('kvFormats', fmt));
-                                                        // 170s en vez de 120s: cubre además un cold start del backend (free/cheap
+                                                        // 170s en vez de 120s: cubre además un cold start de Render (free/cheap
                                                         // tier puede tardar 20-50s en despertar) sumado a los 30-60s reales del
-                                                        // análisis visual — antes el timeout podía ganarle al análisis real.
+                                                        // análisis de Gemini — antes el timeout podía ganarle al análisis real.
                                                         const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 170000);
-                                                        const res = await fetch(`${API_BASE}/api/dco/analyze-brand`, { method: 'POST', headers: authedHeaders(), body: fd, signal: ctrl.signal });
+                                                        const res = await fetch(`${BACKEND_URL}/api/dco/analyze-brand`, { method: 'POST', body: fd, signal: ctrl.signal });
                                                         clearTimeout(t);
                                                         const data = await res.json();
                                                         if (!data.ok) { alert('Error: ' + (data.error || 'desconocido')); setLearnStep('upload'); return; }
@@ -1489,7 +1689,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                         setNewProfileName(data.analysis.brandName || '');
                                                         setNewProfileColor(data.analysis.primaryColor || '#6b7280');
                                                         // Primer borrador de zonas ya ajustado a ESTE KV (headline/logo/beneficios
-                                                        // ubicados según lo que el análisis detectó) — el usuario arrastra para
+                                                        // ubicados según lo que Gemini detectó) — el usuario arrastra para
                                                         // corregir en vez de dibujar 8-14 cajas desde cero.
                                                         if (data.proposedZones && Object.keys(data.proposedZones).length) {
                                                             setManualZones(prev => ({ ...data.proposedZones, ...prev }));
@@ -1500,8 +1700,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                         setLearnStep('upload');
                                                     }
                                                 }}
-                                                style={{ width: '100%', padding: '0.75rem', background: learnFiles.length >= 1 ? ACCENT : 'var(--z-border)', color: '#fff', border: 'none', borderRadius: 9, fontWeight: 800, fontSize: '0.78rem', cursor: learnFiles.length >= 1 ? 'pointer' : 'default', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
-                                                Analizar {learnFiles.length} KV{learnFiles.length !== 1 ? 's' : ''}
+                                                style={{ width: '100%', padding: '0.75rem', background: learnFiles.length >= 1 ? '#E30613' : 'var(--z-border)', color: '#fff', border: 'none', borderRadius: 9, fontWeight: 800, fontSize: '0.78rem', cursor: learnFiles.length >= 1 ? 'pointer' : 'default', textTransform: 'uppercase', letterSpacing: '0.1em' }}>
+                                                Analizar {learnFiles.length} KV{learnFiles.length !== 1 ? 's' : ''} con Gemini
                                             </button>
                                         </>
                                     )}
@@ -1509,8 +1709,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     {/* ANALYZING STEP */}
                                     {learnStep === 'analyzing' && (
                                         <div style={{ textAlign: 'center', padding: '2rem 0' }}>
-                                            <Loader2 size={36} style={{ animation: 'spin 1s linear infinite', color: ACCENT, margin: '0 auto 1rem', display: 'block' }} />
-                                            <div style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--z-text)', marginBottom: '0.4rem' }}>Analizando {learnFiles.length} KVs</div>
+                                            <Loader2 size={36} style={{ animation: 'spin 1s linear infinite', color: '#E30613', margin: '0 auto 1rem', display: 'block' }} />
+                                            <div style={{ fontSize: '0.85rem', fontWeight: 700, color: 'var(--z-text)', marginBottom: '0.4rem' }}>Gemini está analizando {learnFiles.length} KVs</div>
                                             <div style={{ fontSize: '0.72rem', color: 'var(--z-text-muted)' }}>Extrayendo colores, layout, copy, elementos fijos... esto puede tardar 30-60 segundos.</div>
                                         </div>
                                     )}
@@ -1560,7 +1760,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         <>
                                             <div style={{ marginBottom: '0.8rem' }}>
                                                 <label style={{ fontSize: '0.65rem', fontWeight: 700, color: 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', display: 'block', marginBottom: '0.3rem' }}>Nombre de la marca</label>
-                                                <input value={newProfileName} onChange={e => setNewProfileName(e.target.value)} placeholder="Ej: Nombre de tu marca"
+                                                <input value={newProfileName} onChange={e => setNewProfileName(e.target.value)} placeholder="Ej: ETB, Cuidaderm, Fluocardent..."
                                                     style={{ width: '100%', padding: '0.6rem 0.75rem', background: 'var(--z-bg)', border: '1px solid var(--z-border)', borderRadius: 8, color: 'var(--z-text)', fontSize: '0.85rem', fontWeight: 700, outline: 'none', boxSizing: 'border-box' }} />
                                             </div>
                                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem', marginBottom: '1rem' }}>
@@ -1581,11 +1781,11 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                 disabled={!newProfileName.trim()}
                                                 onClick={async () => {
                                                     try {
-                                                        // Email del usuario logueado provisto por el host — sin leer localStorage directamente.
-                                                        const userEmail = currentUserEmail || '';
-                                                        const res = await fetch(`${API_BASE}/api/dco/save-profile`, {
+                                                        const stored = localStorage.getItem('muse_user');
+                                                        const userEmail = stored ? JSON.parse(stored).email : '';
+                                                        const res = await fetch(`${BACKEND_URL}/api/dco/save-profile`, {
                                                             method: 'POST',
-                                                            headers: authedHeaders({ 'Content-Type': 'application/json' }),
+                                                            headers: { 'Content-Type': 'application/json' },
                                                             body: JSON.stringify({
                                                                 name: newProfileName.trim(),
                                                                 color: newProfileColor,
@@ -1646,9 +1846,9 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     const active = mode === m || (m === 'brief' && mode === 'copys');
                                     return (
                                         <button key={m} onClick={() => { setMode(m); setResults([]); setGenStatus('idle'); }}
-                                            style={{ padding: '0.85rem 0.75rem', borderRadius: 10, border: `2px solid ${active ? ACCENT : 'var(--z-border)'}`, background: active ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s' }}>
+                                            style={{ padding: '0.85rem 0.75rem', borderRadius: 10, border: `2px solid ${active ? '#E30613' : 'var(--z-border)'}`, background: active ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', textAlign: 'left', transition: 'all 0.15s' }}>
                                             <div style={{ fontSize: '1.3rem', marginBottom: '0.3rem' }}>{emoji}</div>
-                                            <div style={{ fontSize: '0.8rem', fontWeight: 700, color: active ? ACCENT : 'var(--z-text)', marginBottom: '0.15rem' }}>{label}</div>
+                                            <div style={{ fontSize: '0.8rem', fontWeight: 700, color: active ? '#E30613' : 'var(--z-text)', marginBottom: '0.15rem' }}>{label}</div>
                                             <div style={{ fontSize: '0.65rem', color: 'var(--z-text-muted)', lineHeight: 1.3 }}>{desc}</div>
                                         </button>
                                     );
@@ -1657,11 +1857,11 @@ export default function DCOStudio(props: DCOStudioProps) {
                             {(mode === 'brief' || mode === 'copys') && (
                                 <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.6rem' }}>
                                     <button onClick={() => setMode('brief')}
-                                        style={{ flex: 1, padding: '0.5rem', borderRadius: 8, border: `2px solid ${mode === 'brief' ? ACCENT : 'var(--z-border)'}`, background: mode === 'brief' ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 700, color: mode === 'brief' ? ACCENT : 'var(--z-text-muted)' }}>
+                                        style={{ flex: 1, padding: '0.5rem', borderRadius: 8, border: `2px solid ${mode === 'brief' ? '#E30613' : 'var(--z-border)'}`, background: mode === 'brief' ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 700, color: mode === 'brief' ? '#E30613' : 'var(--z-text-muted)' }}>
                                         Mi Excel ya tiene los copys
                                     </button>
                                     <button onClick={() => setMode('copys')}
-                                        style={{ flex: 1, padding: '0.5rem', borderRadius: 8, border: `2px solid ${mode === 'copys' ? ACCENT : 'var(--z-border)'}`, background: mode === 'copys' ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 700, color: mode === 'copys' ? ACCENT : 'var(--z-text-muted)' }}>
+                                        style={{ flex: 1, padding: '0.5rem', borderRadius: 8, border: `2px solid ${mode === 'copys' ? '#E30613' : 'var(--z-border)'}`, background: mode === 'copys' ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.7rem', fontWeight: 700, color: mode === 'copys' ? '#E30613' : 'var(--z-text-muted)' }}>
                                         Quiero que generes los copys
                                     </button>
                                 </div>
@@ -1677,7 +1877,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     <textarea
                                         value={manualCopy.sceneDesc}
                                         onChange={e => updateCopy('sceneDesc', e.target.value)}
-                                        placeholder="Ej: Persona sonriente usando el producto al aire libre, luz cálida de atardecer"
+                                        placeholder="Ej: Mamá colombiana con dos hijos en un parque tropical, tarde soleada, luz cálida"
                                         rows={2}
                                         style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: 8, border: '2px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.8rem', resize: 'vertical', outline: 'none', fontFamily: 'inherit', lineHeight: 1.4, boxSizing: 'border-box' }}
                                     />
@@ -1688,8 +1888,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     <div style={{ fontSize: '0.65rem', fontWeight: 800, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--z-text-muted)', marginBottom: '0.5rem' }}>5 · Copy</div>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                                         {([
-                                            { field: 'headline', label: 'Titular *', placeholder: 'Ej: Tu titular aquí', bold: true },
-                                            { field: 'cta',      label: 'CTA', placeholder: 'Ej: Tu llamado a la acción' },
+                                            { field: 'headline', label: 'Titular *', placeholder: 'Ej: Listos para la vida', bold: true },
+                                            { field: 'cta',      label: 'CTA', placeholder: 'Ej: Tómalo todos los días, 1 cucharada.' },
                                         ] as { field: keyof typeof manualCopy; label: string; placeholder: string; bold?: boolean; chip?: boolean }[]).map(({ field, label, placeholder, bold, chip }) => (
                                             <div key={field}>
                                                 <div style={{ fontSize: '0.6rem', fontWeight: 700, color: chip ? '#b45309' : 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.2rem' }}>{label}</div>
@@ -1703,13 +1903,13 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         ))}
 
                                         <button onClick={() => setShowAdvancedCopy(v => !v)}
-                                            style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', background: 'none', border: 'none', cursor: 'pointer', padding: '0.3rem 0', fontSize: '0.7rem', fontWeight: 700, color: ACCENT, alignSelf: 'flex-start' }}>
+                                            style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', background: 'none', border: 'none', cursor: 'pointer', padding: '0.3rem 0', fontSize: '0.7rem', fontWeight: 700, color: '#E30613', alignSelf: 'flex-start' }}>
                                             {showAdvancedCopy ? '− Menos detalles' : '+ Más detalles (opcional)'}
                                         </button>
 
                                         {showAdvancedCopy && ([
-                                            { field: 'subhead', label: 'Subtítulo', placeholder: 'Ej: Tu mensaje secundario' },
-                                            { field: 'chip',    label: 'Badge / Chip', placeholder: 'Ej: Badge/sello (opcional)', chip: true },
+                                            { field: 'subhead', label: 'Subtítulo', placeholder: 'Ej: es subirle el ritmo a todo lo que haces.' },
+                                            { field: 'chip',    label: 'Badge / Chip', placeholder: 'Ej: Complejo B (opcional)', chip: true },
                                         ] as { field: keyof typeof manualCopy; label: string; placeholder: string; chip?: boolean }[]).map(({ field, label, placeholder, chip }) => (
                                             <div key={field}>
                                                 <div style={{ fontSize: '0.6rem', fontWeight: 700, color: chip ? '#b45309' : 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.2rem' }}>{label}</div>
@@ -1725,7 +1925,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         {showAdvancedCopy && (
                                             <div>
                                                 <div style={{ fontSize: '0.6rem', fontWeight: 700, color: 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.3rem' }}>
-                                                    Beneficios <span style={{ fontWeight: 400, textTransform: 'none' }}>— bullets cortos, ej. "+Rápido", uno por zona marcada</span>
+                                                    Beneficios <span style={{ fontWeight: 400, textTransform: 'none' }}>— bullets cortos, ej. "+Oportunidades", uno por zona marcada</span>
                                                 </div>
                                                 <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
                                                     {benefits.map((b, i) => (
@@ -1733,7 +1933,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                             <input
                                                                 value={b}
                                                                 onChange={e => updateBenefit(i, e.target.value)}
-                                                                placeholder={`Ej: +Beneficio`}
+                                                                placeholder={`Ej: +Oportunidades`}
                                                                 style={{ flex: 1, padding: '0.55rem 0.75rem', borderRadius: 7, border: '2px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.8rem', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' }}
                                                             />
                                                             {benefits.length > 1 && (
@@ -1764,14 +1964,14 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                     setImageProvider(p);
                                                     if (p === 'gpt') setManualFormats(prev => prev.filter(id => !GPT_UNSUPPORTED_FORMATS.includes(id)));
                                                 }}
-                                                style={{ flex: 1, padding: '0.6rem', borderRadius: 8, border: `2px solid ${imageProvider === p ? ACCENT : 'var(--z-border)'}`, background: imageProvider === p ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.78rem', fontWeight: 600, color: imageProvider === p ? 'var(--z-text)' : 'var(--z-text-secondary)' }}>
+                                                style={{ flex: 1, padding: '0.6rem', borderRadius: 8, border: `2px solid ${imageProvider === p ? '#E30613' : 'var(--z-border)'}`, background: imageProvider === p ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.78rem', fontWeight: 600, color: imageProvider === p ? 'var(--z-text)' : 'var(--z-text-secondary)' }}>
                                                 {p === 'gemini' ? 'Gemini (default)' : 'GPT-image (beta)'}
                                             </button>
                                         ))}
                                     </div>
                                     {imageProvider === 'gpt' && (
                                         <div style={{ fontSize: '0.62rem', color: 'var(--z-text-muted)', marginTop: '0.4rem' }}>
-                                            GPT-image no soporta los formatos banner (se ocultan abajo) — requiere crédito disponible en la cuenta configurada para ese proveedor.
+                                            GPT-image no soporta los formatos banner (se ocultan abajo) — requiere crédito disponible en tu cuenta de OpenAI.
                                         </div>
                                     )}
                                 </div>
@@ -1779,7 +1979,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                 {/* Formatos */}
                                 <div>
                                     <div style={{ fontSize: '0.65rem', fontWeight: 800, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--z-text-muted)', marginBottom: '0.6rem' }}>
-                                        6 · Formatos <span style={{ color: manualFormats.length > 0 ? ACCENT : 'var(--z-text-muted)', fontWeight: 400 }}>({manualFormats.length} seleccionados)</span>
+                                        6 · Formatos <span style={{ color: manualFormats.length > 0 ? '#E30613' : 'var(--z-text-muted)', fontWeight: 400 }}>({manualFormats.length} seleccionados)</span>
                                     </div>
                                     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
                                         {FORMATS.filter(f => imageProvider !== 'gpt' || !GPT_UNSUPPORTED_FORMATS.includes(f.id)).map(f => {
@@ -1787,8 +1987,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                             return (
                                                 <button key={f.id}
                                                     onClick={() => setManualFormats(prev => prev.includes(f.id) ? prev.filter(x => x !== f.id) : [...prev, f.id])}
-                                                    style={{ display: 'flex', alignItems: 'center', gap: '0.7rem', padding: '0.65rem 0.85rem', borderRadius: 8, border: `2px solid ${active ? ACCENT : 'var(--z-border)'}`, background: active ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', transition: 'all 0.15s' }}>
-                                                    <div style={{ width: 20, height: 20, borderRadius: 5, border: `2px solid ${active ? ACCENT : 'var(--z-border-strong)'}`, background: active ? ACCENT : 'transparent', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                                    style={{ display: 'flex', alignItems: 'center', gap: '0.7rem', padding: '0.65rem 0.85rem', borderRadius: 8, border: `2px solid ${active ? '#E30613' : 'var(--z-border)'}`, background: active ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', transition: 'all 0.15s' }}>
+                                                    <div style={{ width: 20, height: 20, borderRadius: 5, border: `2px solid ${active ? '#E30613' : 'var(--z-border-strong)'}`, background: active ? '#E30613' : 'transparent', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                                                         {active && <Check size={11} color="#fff" strokeWidth={3} />}
                                                     </div>
                                                     <div style={{ color: active ? 'var(--z-text)' : 'var(--z-text-secondary)' }}>
@@ -1816,8 +2016,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                             4 · Cuadro de materiales
                                         </div>
                                         <a
-                                            href={`${API_BASE}/api/dco/template`}
-                                            download="plantilla_dco.xlsx"
+                                            href={`${BACKEND_URL}/api/dco/template`}
+                                            download="plantilla_dco_muse.xlsx"
                                             style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', fontSize: '0.65rem', fontWeight: 700, color: '#16a34a', textDecoration: 'none', padding: '3px 10px', border: '1px solid #16a34a', borderRadius: 5, whiteSpace: 'nowrap', letterSpacing: '0.04em' }}
                                             title="Descargar plantilla Excel en blanco"
                                         >
@@ -1874,7 +2074,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                 {selectedRows.size} de {briefRows.length} seleccionadas
                                             </span>
                                             <button onClick={toggleSelectAll}
-                                                style={{ fontSize: '0.72rem', fontWeight: 700, color: ACCENT, background: 'none', border: 'none', cursor: 'pointer', padding: '0.2rem 0.5rem', borderRadius: 5, textDecoration: 'underline' }}>
+                                                style={{ fontSize: '0.72rem', fontWeight: 700, color: '#E30613', background: 'none', border: 'none', cursor: 'pointer', padding: '0.2rem 0.5rem', borderRadius: 5, textDecoration: 'underline' }}>
                                                 {selectedRows.size === briefRows.length ? 'Ninguna' : 'Todas'}
                                             </button>
                                         </div>
@@ -1887,10 +2087,10 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                 return (
                                                     <div key={row.rowIndex}
                                                         onClick={() => toggleRow(row.rowIndex)}
-                                                        style={{ display: 'flex', alignItems: 'flex-start', gap: '0.65rem', padding: '0.75rem', borderRadius: 10, border: `2px solid ${selected ? ACCENT : 'var(--z-border)'}`, background: selected ? accentA(0.04) : 'var(--z-bg)', cursor: 'pointer', transition: 'all 0.15s' }}>
+                                                        style={{ display: 'flex', alignItems: 'flex-start', gap: '0.65rem', padding: '0.75rem', borderRadius: 10, border: `2px solid ${selected ? '#E30613' : 'var(--z-border)'}`, background: selected ? 'rgba(227,6,19,0.04)' : 'var(--z-bg)', cursor: 'pointer', transition: 'all 0.15s' }}>
 
                                                         {/* Checkbox grande */}
-                                                        <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${selected ? ACCENT : 'var(--z-border-strong)'}`, background: selected ? ACCENT : 'transparent', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', marginTop: 1 }}>
+                                                        <div style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${selected ? '#E30613' : 'var(--z-border-strong)'}`, background: selected ? '#E30613' : 'transparent', flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', marginTop: 1 }}>
                                                             {selected && <Check size={12} color="#fff" strokeWidth={3} />}
                                                         </div>
 
@@ -1932,12 +2132,12 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     2 · Generación automática
                                 </div>
                                 <div style={{ fontSize: '0.72rem', color: 'var(--z-text-muted)', lineHeight: 1.4 }}>
-                                    Lee el copy y la categoría del KV, propone audiencias reales (con edad, características y perfil visual — vestuario/accesorios/entorno) y genera el copy adaptado para cada una. Después elegís cuáles convertir en imagen final.
+                                    Lee el copy y la categoría del KV, propone audiencias reales (con edad, características y perfil visual — ropa/casco/entorno) y genera el copy adaptado para cada una. Después elegís cuáles convertir en imagen final.
                                 </div>
                                 <div>
                                     <div style={{ fontSize: '0.6rem', fontWeight: 700, color: 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.3rem' }}>Contexto del negocio <span style={{ fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(opcional, pero ayuda mucho)</span></div>
                                     <input type="text" value={autoBusinessContext} onChange={e => setAutoBusinessContext(e.target.value)}
-                                        placeholder='ej. "Empresa de telecomunicaciones B2C"'
+                                        placeholder='ej. "ETB — telefonía móvil e internet en Colombia"'
                                         style={{ width: '100%', padding: '0.5rem 0.6rem', borderRadius: 7, border: '1px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.78rem', outline: 'none', boxSizing: 'border-box' }} />
                                 </div>
                                 <div>
@@ -1947,7 +2147,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         style={{ width: '100%', padding: '0.5rem 0.6rem', borderRadius: 7, border: '1px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.78rem', outline: 'none', boxSizing: 'border-box' }} />
                                 </div>
                                 <button onClick={generateAutomatic} disabled={!kvFile || autoGenerating}
-                                    style={{ width: '100%', padding: '0.85rem', borderRadius: 10, border: 'none', background: (!kvFile || autoGenerating) ? 'var(--z-border)' : `linear-gradient(135deg, ${ACCENT}, ${ACCENT_DARK})`, color: (!kvFile || autoGenerating) ? 'var(--z-text-muted)' : '#fff', fontWeight: 800, fontSize: '0.85rem', letterSpacing: '0.05em', textTransform: 'uppercase', cursor: (!kvFile || autoGenerating) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.6rem' }}>
+                                    style={{ width: '100%', padding: '0.85rem', borderRadius: 10, border: 'none', background: (!kvFile || autoGenerating) ? 'var(--z-border)' : 'linear-gradient(135deg, #E30613, #c00010)', color: (!kvFile || autoGenerating) ? 'var(--z-text-muted)' : '#fff', fontWeight: 800, fontSize: '0.85rem', letterSpacing: '0.05em', textTransform: 'uppercase', cursor: (!kvFile || autoGenerating) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.6rem' }}>
                                     {autoGenerating
                                         ? <><Loader2 size={16} style={{ animation: 'spin 1s linear infinite' }} /> Generando audiencias y copys...</>
                                         : !kvFile ? '← Sube el KV primero' : <><Sparkles size={16} /> Generar automáticamente</>}
@@ -1962,11 +2162,11 @@ export default function DCOStudio(props: DCOStudioProps) {
                                 {/* Fuente: Excel existente vs. formulario de audiencias directo */}
                                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                                     <button onClick={() => setCopySource('excel')}
-                                        style={{ flex: 1, padding: '0.55rem', borderRadius: 8, border: `2px solid ${copySource === 'excel' ? ACCENT : 'var(--z-border)'}`, background: copySource === 'excel' ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.72rem', fontWeight: 700, color: copySource === 'excel' ? ACCENT : 'var(--z-text-muted)' }}>
+                                        style={{ flex: 1, padding: '0.55rem', borderRadius: 8, border: `2px solid ${copySource === 'excel' ? '#E30613' : 'var(--z-border)'}`, background: copySource === 'excel' ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.72rem', fontWeight: 700, color: copySource === 'excel' ? '#E30613' : 'var(--z-text-muted)' }}>
                                         Desde Excel
                                     </button>
                                     <button onClick={() => setCopySource('audiences')}
-                                        style={{ flex: 1, padding: '0.55rem', borderRadius: 8, border: `2px solid ${copySource === 'audiences' ? ACCENT : 'var(--z-border)'}`, background: copySource === 'audiences' ? accentA(0.06) : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.72rem', fontWeight: 700, color: copySource === 'audiences' ? ACCENT : 'var(--z-text-muted)' }}>
+                                        style={{ flex: 1, padding: '0.55rem', borderRadius: 8, border: `2px solid ${copySource === 'audiences' ? '#E30613' : 'var(--z-border)'}`, background: copySource === 'audiences' ? 'rgba(227,6,19,0.06)' : 'var(--z-bg)', cursor: 'pointer', fontSize: '0.72rem', fontWeight: 700, color: copySource === 'audiences' ? '#E30613' : 'var(--z-text-muted)' }}>
                                         Desde audiencias (sin Excel)
                                     </button>
                                 </div>
@@ -1977,15 +2177,15 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         4 · Cuadro base (copys existentes)
                                     </div>
                                     {copyBriefFile ? (
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.7rem 0.85rem', background: accentA(0.06), borderRadius: 8, border: `2px solid ${ACCENT}` }}>
-                                            <Table2 size={18} color={ACCENT} />
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', padding: '0.7rem 0.85rem', background: 'rgba(227,6,19,0.06)', borderRadius: 8, border: '2px solid #E30613' }}>
+                                            <Table2 size={18} color="#E30613" />
                                             <span style={{ flex: 1, fontSize: '0.8rem', fontWeight: 600, color: 'var(--z-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{copyBriefFile.name}</span>
                                             <button onClick={() => { setCopyBriefFile(null); setCopyPieces([]); setCopyIdentity(null); setCopyError(''); }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--z-text-muted)', display: 'flex', padding: 0 }}><X size={15} /></button>
                                         </div>
                                     ) : (
                                         <div onClick={() => copyBriefInputRef.current?.click()}
                                             style={{ border: '2px dashed var(--z-border-strong)', borderRadius: 10, padding: '2rem 1rem', textAlign: 'center', cursor: 'pointer', background: 'var(--z-bg)' }}>
-                                            <Sparkles size={26} color={ACCENT} style={{ margin: '0 auto 0.6rem' }} />
+                                            <Sparkles size={26} color="#E30613" style={{ margin: '0 auto 0.6rem' }} />
                                             <div style={{ fontSize: '0.88rem', fontWeight: 700, color: 'var(--z-text-secondary)', marginBottom: '0.25rem' }}>Sube el cuadro de materiales base</div>
                                             <div style={{ fontSize: '0.7rem', color: 'var(--z-text-muted)' }}>De aquí aprendo la identidad de copy · .xlsx</div>
                                         </div>
@@ -2013,7 +2213,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                             <div key={i} style={{ padding: '0.7rem', borderRadius: 9, border: '2px solid var(--z-border)', background: 'var(--z-bg)', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
                                                 <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
                                                     <input value={aud.name} onChange={e => setAudienceList(prev => prev.map((a, idx) => idx === i ? { ...a, name: e.target.value } : a))}
-                                                        placeholder={`Audiencia ${i + 1} (ej: Profesionales jóvenes urbanos)`}
+                                                        placeholder={`Audiencia ${i + 1} (ej: Madres jóvenes urbanas)`}
                                                         style={{ flex: 1, padding: '0.5rem 0.6rem', borderRadius: 6, border: '1px solid var(--z-border)', background: 'var(--z-surface)', color: 'var(--z-text)', fontSize: '0.78rem', fontWeight: 600, outline: 'none', boxSizing: 'border-box' }} />
                                                     {audienceList.length > 1 && (
                                                         <button onClick={() => setAudienceList(prev => prev.filter((_, idx) => idx !== i))}
@@ -2043,15 +2243,15 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                         </button>
                                     ))}
                                                 </div>
-                                                {/* Perfil visual (vestuario/accesorios/entorno) — lo propone la IA, pero es
-                                                    100% editable acá antes de generar copy/imagen; así se puede corregir si
-                                                    no encaja con la marca. */}
+                                                {/* Perfil visual (ropa/casco/entorno) — lo propone la IA, pero es 100% editable
+                                                    acá antes de generar copy/imagen; así se puede corregir si no encaja
+                                                    con la marca (ej. quitar un vehículo que no corresponde). */}
                                                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.4rem' }}>
                                                     <input value={aud.wardrobe || ''} onChange={e => setAudienceList(prev => prev.map((a, idx) => idx === i ? { ...a, wardrobe: e.target.value } : a))}
                                                         placeholder="Ropa del personaje"
                                                         style={{ padding: '0.4rem 0.55rem', borderRadius: 6, border: '1px solid var(--z-border)', background: 'var(--z-surface)', color: 'var(--z-text)', fontSize: '0.68rem', outline: 'none', boxSizing: 'border-box' }} />
                                                     <input value={aud.headwear || ''} onChange={e => setAudienceList(prev => prev.map((a, idx) => idx === i ? { ...a, headwear: e.target.value } : a))}
-                                                        placeholder="Accesorio de cabeza"
+                                                        placeholder="Casco/accesorio de cabeza"
                                                         style={{ padding: '0.4rem 0.55rem', borderRadius: 6, border: '1px solid var(--z-border)', background: 'var(--z-surface)', color: 'var(--z-text)', fontSize: '0.68rem', outline: 'none', boxSizing: 'border-box' }} />
                                                 </div>
                                                 <input value={aud.environment || ''} onChange={e => setAudienceList(prev => prev.map((a, idx) => idx === i ? { ...a, environment: e.target.value } : a))}
@@ -2096,7 +2296,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     const canGo = copySource === 'excel' ? !!copyBriefFile : hasFilledAudience;
                                     return (
                                         <button onClick={copySource === 'excel' ? generateCopies : generateCopiesFromAudiences} disabled={!canGo || copyLoading}
-                                            style={{ width: '100%', padding: '0.8rem', borderRadius: 10, border: 'none', background: (!canGo || copyLoading) ? 'var(--z-border)' : `linear-gradient(135deg, ${ACCENT}, ${ACCENT_DARK})`, color: (!canGo || copyLoading) ? 'var(--z-text-muted)' : '#fff', fontWeight: 800, fontSize: '0.85rem', letterSpacing: '0.05em', textTransform: 'uppercase', cursor: (!canGo || copyLoading) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
+                                            style={{ width: '100%', padding: '0.8rem', borderRadius: 10, border: 'none', background: (!canGo || copyLoading) ? 'var(--z-border)' : 'linear-gradient(135deg, #E30613, #c00010)', color: (!canGo || copyLoading) ? 'var(--z-text-muted)' : '#fff', fontWeight: 800, fontSize: '0.85rem', letterSpacing: '0.05em', textTransform: 'uppercase', cursor: (!canGo || copyLoading) ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}>
                                             {copyLoading ? <><Loader2 size={15} style={{ animation: 'spin 1s linear infinite' }} /> Analizando y generando...</> : <><Sparkles size={15} /> Generar copys</>}
                                         </button>
                                     );
@@ -2105,7 +2305,7 @@ export default function DCOStudio(props: DCOStudioProps) {
 
                                 {copyIdentity && (
                                     <div style={{ padding: '0.75rem 0.85rem', background: 'var(--z-bg)', borderRadius: 9, border: '1px solid var(--z-border)' }}>
-                                        <div style={{ fontSize: '0.6rem', fontWeight: 800, letterSpacing: '0.1em', textTransform: 'uppercase', color: ACCENT, marginBottom: '0.5rem' }}>Identidad de copy detectada</div>
+                                        <div style={{ fontSize: '0.6rem', fontWeight: 800, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#E30613', marginBottom: '0.5rem' }}>Identidad de copy detectada</div>
                                         {copyIdentity.tono && <div style={{ fontSize: '0.7rem', color: 'var(--z-text)', marginBottom: '0.3rem' }}><b>Tono:</b> {copyIdentity.tono}</div>}
                                         {copyIdentity.formula && <div style={{ fontSize: '0.7rem', color: 'var(--z-text)', marginBottom: '0.3rem' }}><b>Fórmula:</b> {copyIdentity.formula}</div>}
                                         {copyIdentity.resumen && <div style={{ fontSize: '0.68rem', color: 'var(--z-text-secondary)', lineHeight: 1.4, marginBottom: '0.3rem' }}>{copyIdentity.resumen}</div>}
@@ -2123,7 +2323,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                 <div>
                                     <div style={{ fontSize: '0.65rem', fontWeight: 800, letterSpacing: '0.12em', textTransform: 'uppercase', color: 'var(--z-text-muted)', marginBottom: '0.5rem' }}>4 · Historia a contar</div>
                                     <textarea value={carouselNarrative} onChange={e => setCarouselNarrative(e.target.value)} rows={4}
-                                        placeholder="Ej: El protagonista empieza el día con un problema cotidiano, descubre el producto en su rutina, y termina el día con una solución satisfactoria."
+                                        placeholder="Ej: Ana empieza el día agotada, descubre el producto en su rutina matutina, y termina el día llena de energía lista para todo."
                                         style={{ width: '100%', padding: '0.6rem 0.75rem', borderRadius: 8, border: '2px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.8rem', resize: 'vertical', outline: 'none', fontFamily: 'inherit', lineHeight: 1.4, boxSizing: 'border-box' }} />
                                     {!characterId && <div style={{ fontSize: '0.62rem', color: '#f59e0b', marginTop: '0.4rem' }}>⚠ Elegí un personaje arriba para que la historia mantenga la misma persona en todos los slides.</div>}
                                 </div>
@@ -2201,7 +2401,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     <div style={{ fontSize: '0.85rem', fontWeight: 800, color: 'var(--z-text)' }}>{copyPieces.length} copys generados</div>
                                     <div style={{ display: 'flex', gap: '0.5rem' }}>
                                         <button onClick={downloadCuadro} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 1rem', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 7, fontSize: '0.72rem', fontWeight: 700, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.04em' }}><Download size={13} /> Descargar cuadro</button>
-                                        <button onClick={sendCopiesToDCO} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 1rem', background: ACCENT, color: '#fff', border: 'none', borderRadius: 7, fontSize: '0.72rem', fontWeight: 700, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.04em' }}><Sparkles size={13} /> Enviar al DCO</button>
+                                        <button onClick={sendCopiesToDCO} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 1rem', background: '#E30613', color: '#fff', border: 'none', borderRadius: 7, fontSize: '0.72rem', fontWeight: 700, cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.04em' }}><Sparkles size={13} /> Enviar al DCO</button>
                                     </div>
                                 </div>
                                 {/* ── Recrear con IA (foto real vía outpainting) — formatos que soporta GPT-image ── */}
@@ -2223,9 +2423,9 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         <div key={i} style={{ borderRadius: 10, border: '1px solid var(--z-border)', background: 'var(--z-surface)', padding: '0.85rem' }}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.6rem', flexWrap: 'wrap' }}>
                                                 <span style={{ fontSize: '0.78rem', fontWeight: 800, color: 'var(--z-text)' }}>{p.audiencia || '—'}</span>
-                                                {p.variante && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: ACCENT, background: accentA(0.1), borderRadius: 4, padding: '1px 7px' }}>{p.variante}</span>}
+                                                {p.variante && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#E30613', background: 'rgba(227,6,19,0.1)', borderRadius: 4, padding: '1px 7px' }}>{p.variante}</span>}
                                                 {p.nuevaAudiencia && <span style={{ fontSize: '0.58rem', fontWeight: 700, color: '#16a34a', background: 'rgba(22,163,74,0.12)', border: '1px solid #16a34a', borderRadius: 4, padding: '1px 6px' }}>AUDIENCIA NUEVA</span>}
-                                                {p.chip && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#b45309', background: 'rgba(255,215,0,0.15)', borderRadius: 4, padding: '1px 7px' }}>{p.chip}</span>}
+                                                {p.vitamina_chip && <span style={{ fontSize: '0.6rem', fontWeight: 700, color: '#b45309', background: 'rgba(255,215,0,0.15)', borderRadius: 4, padding: '1px 7px' }}>{p.vitamina_chip}</span>}
                                             </div>
                                             {([['copy_principal', 'Copy principal'], ['desarrollo', 'Desarrollo'], ['cierre', 'Cierre']] as const).map(([field, label]) => (
                                                 <div key={field} style={{ marginBottom: '0.45rem' }}>
@@ -2235,8 +2435,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                 </div>
                                             ))}
                                             {/* Perfil visual del personaje para esta pieza — editable acá mismo antes de
-                                                recrear la imagen, por si la IA propuso algo que no encaja (ej. un accesorio
-                                                que no corresponde a esta marca). */}
+                                                recrear la imagen, por si la IA propuso algo que no encaja (ej. un vehículo
+                                                o accesorio que no corresponde a esta marca). */}
                                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.35rem', marginBottom: '0.45rem' }}>
                                                 <div>
                                                     <div style={{ fontSize: '0.55rem', fontWeight: 700, color: 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.15rem' }}>Ropa del personaje</div>
@@ -2244,7 +2444,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                         style={{ width: '100%', padding: '0.35rem 0.5rem', borderRadius: 6, border: '1px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.66rem', outline: 'none', boxSizing: 'border-box' }} />
                                                 </div>
                                                 <div>
-                                                    <div style={{ fontSize: '0.55rem', fontWeight: 700, color: 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.15rem' }}>Accesorio</div>
+                                                    <div style={{ fontSize: '0.55rem', fontWeight: 700, color: 'var(--z-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '0.15rem' }}>Casco/accesorio</div>
                                                     <input value={p.headwear || ''} onChange={e => updateCopyPiece(i, 'headwear', e.target.value)}
                                                         style={{ width: '100%', padding: '0.35rem 0.5rem', borderRadius: 6, border: '1px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.66rem', outline: 'none', boxSizing: 'border-box' }} />
                                                 </div>
@@ -2254,9 +2454,8 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                 <input value={p.environment || ''} onChange={e => updateCopyPiece(i, 'environment', e.target.value)}
                                                     style={{ width: '100%', padding: '0.35rem 0.5rem', borderRadius: 6, border: '1px solid var(--z-border)', background: 'var(--z-bg)', color: 'var(--z-text)', fontSize: '0.66rem', outline: 'none', boxSizing: 'border-box' }} />
                                             </div>
-                                            {/* Modo creativo — libera TAMBIÉN el ángulo/escena/acción (no solo vestuario/
-                                                entorno). Apagado por defecto: algunas marcas necesitan conservar un
-                                                encuadre específico. */}
+                                            {/* Modo creativo — libera TAMBIÉN el ángulo/escena/acción (no solo ropa/entorno).
+                                                Apagado por defecto: algunas marcas necesitan conservar un encuadre específico. */}
                                             <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.6rem', cursor: 'pointer', fontSize: '0.66rem', color: 'var(--z-text-muted)' }}>
                                                 <input type="checkbox" checked={!!p.varyScene} onChange={e => updateCopyPiece(i, 'varyScene', e.target.checked)} />
                                                 🎨 Variar escena y ángulo (modo creativo) — para esta audiencia, proponer un encuadre/situación nuevos en vez de mantener el mismo que el KV
@@ -2322,7 +2521,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                     <CheckCircle2 size={14} color="#22c55e" />
                                                     {item.qaAttempts === 2 && <div title="QA detectó errores y se reintentó" style={{ fontSize: '0.58rem', color: '#a78bfa', background: 'rgba(167,139,250,0.12)', border: '1px solid rgba(167,139,250,0.3)', borderRadius: 4, padding: '1px 6px', whiteSpace: 'nowrap' }}>QA ↺</div>}
                                                     <button onClick={() => downloadImage(item)}
-                                                        style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', padding: '3px 10px', background: ACCENT, color: '#fff', border: 'none', borderRadius: 5, fontSize: '0.65rem', fontWeight: 700, cursor: 'pointer' }}>
+                                                        style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', padding: '3px 10px', background: '#E30613', color: '#fff', border: 'none', borderRadius: 5, fontSize: '0.65rem', fontWeight: 700, cursor: 'pointer' }}>
                                                         <Download size={10} /> JPG
                                                     </button>
                                                     {/* Re-generar en otro formato */}
@@ -2338,7 +2537,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                                 <div style={{ fontSize: '0.6rem', color: 'var(--z-text-muted)', marginBottom: '0.3rem', paddingLeft: 4, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Mismo copy · nuevo formato</div>
                                                                 {FORMATS.map(f => (
                                                                     <button key={f.id} onClick={() => regenerateInFormat(item, f.id)}
-                                                                        style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '4px 8px', background: f.id === item.format ? accentA(0.12) : 'none', border: 'none', borderRadius: 5, fontSize: '0.65rem', color: 'var(--z-text)', cursor: 'pointer', gap: '0.5rem', textAlign: 'left' }}>
+                                                                        style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '4px 8px', background: f.id === item.format ? 'rgba(227,6,19,0.12)' : 'none', border: 'none', borderRadius: 5, fontSize: '0.65rem', color: 'var(--z-text)', cursor: 'pointer', gap: '0.5rem', textAlign: 'left' }}>
                                                                         <span>{f.label}</span>
                                                                         <span style={{ color: 'var(--z-text-muted)', fontSize: '0.58rem' }}>{f.dims}</span>
                                                                     </button>
@@ -2350,7 +2549,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                     <button
                                                         onClick={() => setShowCopy(prev => ({ ...prev, [item.taskId]: !prev[item.taskId] }))}
                                                         title="Ver copy usado"
-                                                        style={{ padding: '3px 7px', background: showCopy[item.taskId] ? accentA(0.1) : 'none', border: '1px solid var(--z-border)', borderRadius: 5, fontSize: '0.65rem', color: 'var(--z-text)', cursor: 'pointer' }}>
+                                                        style={{ padding: '3px 7px', background: showCopy[item.taskId] ? 'rgba(227,6,19,0.1)' : 'none', border: '1px solid var(--z-border)', borderRadius: 5, fontSize: '0.65rem', color: 'var(--z-text)', cursor: 'pointer' }}>
                                                         {showCopy[item.taskId] ? '▲ Copy' : '▼ Copy'}
                                                     </button>
                                                     {item.status === 'done' && (
@@ -2364,7 +2563,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                                                     const logoDataUrl = logoPreview && logoPreview.startsWith('data:') ? logoPreview : '';
                                                                     const logoB64 = logoDataUrl ? logoDataUrl.slice(logoDataUrl.indexOf(',') + 1) : undefined;
                                                                     const logoMime = logoDataUrl ? (logoDataUrl.match(/^data:([^;]+);/)?.[1] || 'image/png') : undefined;
-                                                                    const res = await fetch(`${API_BASE}/api/dco/generate-gif`, { method: 'POST', headers: authedHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ imageBase64: item.imageBase64, mimeType: item.mimeType || 'image/jpeg', formatId: item.format, width: item.width, height: item.height, headline: item.copyData?.headline || '', cta: item.copyData?.cta || '', logoBase64: logoB64, logoMime }) });
+                                                                    const res = await fetch(`${BACKEND_URL}/api/dco/generate-gif`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ imageBase64: item.imageBase64, mimeType: item.mimeType || 'image/jpeg', formatId: item.format, width: item.width, height: item.height, headline: item.copyData?.headline || '', cta: item.copyData?.cta || '', logoBase64: logoB64, logoMime }) });
                                                                     const data = await res.json() as any;
                                                                     if (data.gifBase64) { setResults(prev => prev.map(r => r.taskId === item.taskId ? { ...r, gifBase64: data.gifBase64 } : r)); setShowGif(prev => ({ ...prev, [item.taskId]: true })); }
                                                                 } catch (e) { console.warn('GIF error', e); } finally { setGifLoading(prev => ({ ...prev, [item.taskId]: false })); }
@@ -2407,7 +2606,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                             <textarea
                                                 value={feedbackComments[item.taskId] || ''}
                                                 onChange={e => setFeedbackComments(prev => ({ ...prev, [item.taskId]: e.target.value }))}
-                                                placeholder="Ej: el titular está en negro, cámbialo a blanco · la silueta está sobre un elemento equivocado, muévela · la zona izquierda quedó vacía, agrega el copy ahí..."
+                                                placeholder="Ej: el titular está en negro, cámbialo a blanco · la silueta está sobre el niño, ponla sobre el adulto · la zona izquierda quedó vacía, agrega el copy ahí..."
                                                 rows={3}
                                                 style={{ width: '100%', padding: '0.35rem 0.5rem', background: 'var(--z-bg)', border: '1px solid #ef4444', borderRadius: 5, color: 'var(--z-text)', fontSize: '0.65rem', resize: 'vertical', outline: 'none', boxSizing: 'border-box' }}
                                             />
@@ -2437,7 +2636,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                             {[
                                                 { label: 'Titular', value: item.copyData.headline },
                                                 { label: 'Subtítulo', value: item.copyData.subhead },
-                                                { label: 'Pill badge', value: item.copyData.chip },
+                                                { label: 'Pill badge', value: item.copyData.vitamina_chip },
                                                 { label: 'Body', value: item.copyData.body },
                                                 { label: 'CTA', value: item.copyData.cta },
                                             ].filter(f => f.value).map(f => (
@@ -2550,7 +2749,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                         );
                                     })()}
 
-                                    {/* Copy preview en modo brief */}
+                                                                        {/* Copy preview en modo brief */}
                                     {mode === 'brief' && item.copyPreview && !showCopy[item.taskId] && (
                                         <div style={{ padding: '0.4rem 0.85rem', borderBottom: '1px solid var(--z-border)', fontSize: '0.63rem', color: 'var(--z-text-muted)', lineHeight: 1.4, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
                                             {item.copyPreview}
@@ -2560,7 +2759,7 @@ export default function DCOStudio(props: DCOStudioProps) {
                                     {/* Imagen principal — solo si no hay picker activo */}
                                     <div style={{ minHeight: 110, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--z-bg-secondary)' }}>
                                         {item.status === 'waiting'    && <div style={{ color: 'var(--z-text-muted)', fontSize: '0.72rem' }}>En espera...</div>}
-                                        {item.status === 'generating' && <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem', color: 'var(--z-text-muted)', fontSize: '0.72rem' }}><Loader2 size={22} style={{ animation: 'spin 1s linear infinite', color: ACCENT }} />Generando...</div>}
+                                        {item.status === 'generating' && <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem', color: 'var(--z-text-muted)', fontSize: '0.72rem' }}><Loader2 size={22} style={{ animation: 'spin 1s linear infinite', color: '#E30613' }} />Generando...</div>}
                                         {item.status === 'qa_check'   && <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem', color: '#a78bfa', fontSize: '0.72rem' }}><Loader2 size={22} style={{ animation: 'spin 1s linear infinite', color: '#a78bfa' }} />QA · validando...</div>}
                                         {item.status === 'done' && item.imageBase64 && <img src={`data:${item.mimeType};base64,${item.imageBase64}`} alt={item.format} style={{ width: '100%', display: 'block', maxHeight: 440, objectFit: 'contain' }} />}
                                         {item.status === 'error' && <div style={{ padding: '1.25rem', textAlign: 'center', color: '#ef4444', fontSize: '0.72rem' }}><AlertCircle size={18} style={{ margin: '0 auto 0.4rem' }} />{item.error || 'Error al generar'}</div>}
@@ -2590,4 +2789,5 @@ export default function DCOStudio(props: DCOStudioProps) {
             <style>{`@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
         </div>
     );
-}
+};
+

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "DCO Studio engine — Hono server exposing the creative-generation API. Bring your own AI/storage providers via src/adapters.",
+  "description": "DCO Studio engine — verbatim port of MUSE's DCO backend (routes/dco.ts + services). Mounts on any Hono app.",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
@@ -26,11 +26,11 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@types/culori": "^2.1.1",
-    "@types/jpeg-js": "^0.3.7",
-    "@types/node": "^20.14.0",
+    "@types/culori": "^4.0.1",
+    "@types/jpeg-js": "^0.3.0",
+    "@types/node": "^22.14.0",
     "@types/pngjs": "^6.0.5",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.2"
   }
 }

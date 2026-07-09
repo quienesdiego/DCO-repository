@@ -1,8 +1,8 @@
 /// <reference types="vite/client" />
 
 interface ImportMetaEnv {
-  readonly VITE_DCO_API_URL?: string;
-  readonly VITE_DCO_API_SECRET?: string;
+  /** Read directly by DCOView.tsx — same env var name as the source MUSE frontend. */
+  readonly VITE_API_URL?: string;
 }
 
 interface ImportMeta {

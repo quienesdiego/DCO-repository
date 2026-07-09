@@ -1,32 +1,31 @@
 /**
- * Deterministic brand layer — ALL text and logos on a creative are drawn here, in
- * code (sharp + SVG + embedded professional fonts), never by the image-generation
- * model. This is the only reliable way to get real consistency at scale: a diffusion
- * model sometimes renders text well and sometimes doesn't (it's a coin flip); this
- * layer puts the same text, in the same place, with the same style, every time.
+ * Capa de marca determinística — TODO el texto y los logos de un creativo se dibujan
+ * acá, con código (sharp + SVG + fuentes profesionales embebidas), nunca por el modelo
+ * de imagen. Es la única forma de garantizar consistencia real en producción masiva:
+ * un modelo de difusión a veces escribe bien y a veces no (ruleta); esta capa pone lo
+ * mismo, en el mismo lugar, con el mismo estilo, siempre.
  *
- * Real display fonts (Anton, Archivo Black, Barlow Condensed Black/Italic…),
- * registered via fontconfig, layered outlines (fill + stroke + outline), skewX for
- * aggressive italics, offset drop shadows, and bars/pills that match your reference
- * creative's geometry — all parametrized by the brand identity you feed in
- * (either a hand-authored BrandLayerStyle or one derived from an extracted identity
- * via deriveBrandLayerStyle).
+ * El "sale plano" del intento anterior se debía a Arial del sistema + relleno plano.
+ * Ahora: fuentes display reales (Anton, Archivo Black, Barlow Condensed Black/Italic…)
+ * registradas vía fontconfig, contornos en capas (fill + stroke + outline), inclinación
+ * skewX para itálicas agresivas, sombras desplazadas y barras/pills con la geometría
+ * del KV — todo parametrizado por la identidad extraída de la marca.
  */
-// Order matters: fontSetup registers FONTCONFIG_PATH and must run before sharp is
-// loaded (the native binding captures the env var when its DLL loads).
+// El orden importa: fontSetup registra FONTCONFIG_PATH y debe ejecutarse antes de que
+// se cargue sharp (la librería nativa captura el env al cargar su DLL).
 import './fontSetup.js';
 import sharp from 'sharp';
 
-// ─── Types ─────────────────────────────────────────────────────────────────────
+// ─── Tipos ─────────────────────────────────────────────────────────────────────
 
-export interface ZoneBox { x: number; y: number; w: number; h: number } // % of frame (0-100)
+export interface ZoneBox { x: number; y: number; w: number; h: number } // % del frame (0-100)
 
 export type BrandZoneKind = 'headline' | 'subhead' | 'chip' | 'cta' | 'benefit' | 'brand_name';
 
 export interface BrandTextZone extends ZoneBox {
     kind: BrandZoneKind;
     text: string;
-    index?: number; // for benefits (benefit_1 → 0)
+    index?: number; // para benefits (benefit_1 → 0)
 }
 
 export interface GraphicOverlayZone extends ZoneBox {
@@ -35,21 +34,21 @@ export interface GraphicOverlayZone extends ZoneBox {
     imageMime: string;
 }
 
-// Full visual style of the layer — derived from an extracted/learned brand identity.
-// Every field has a usable default so a brand with no identity yet still produces a
-// decent layer instead of a plain black box.
+// Estilo visual completo de la capa — derivado de la identidad de marca extraída
+// (analyze-brand / auto-extracción del KV). Todo tiene default utilizable para que
+// una marca sin identidad igual produzca una capa digna, no una caja negra.
 export interface BrandLayerStyle {
     headlineFont: string;
     headlineFill: string;
-    headlineStroke: string | null;   // thick outer outline
-    headlineOutline: string | null;  // thin secondary outline (between stroke and fill)
-    headlineSkewDeg: number;         // 0 = upright; negative = forward italic
+    headlineStroke: string | null;   // contorno exterior grueso
+    headlineOutline: string | null;  // segundo contorno fino (entre stroke y fill)
+    headlineSkewDeg: number;         // 0 = recto; negativo = itálica hacia adelante
     headlineCase: 'upper' | 'as-is';
     subheadFont: string;
     subheadFill: string;
-    benefitBarColor: string;         // bar behind benefit bullet text
+    benefitBarColor: string;         // barra detrás del texto de beneficio
     benefitTextColor: string;
-    benefitIconColor: string;        // the "+" / bullet icon
+    benefitIconColor: string;        // el "+" / badge a la izquierda
     benefitSkewDeg: number;
     benefitFont: string;
     ctaBgColor: string;
@@ -61,12 +60,7 @@ export interface BrandLayerStyle {
     accentColor: string;
 }
 
-/**
- * Default style used whenever an identity doesn't specify a given field. Swap this
- * out (or pass your own base into deriveBrandLayerStyle by pre-merging) to set your
- * own house style defaults.
- */
-export const DEFAULT_STYLE: BrandLayerStyle = {
+const DEFAULT_STYLE: BrandLayerStyle = {
     headlineFont: 'Anton',
     headlineFill: '#FFFFFF',
     headlineStroke: '#000000',
@@ -92,9 +86,8 @@ export const DEFAULT_STYLE: BrandLayerStyle = {
 function isHex(v: any): v is string { return typeof v === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(v.trim()); }
 function hex(v: any, fallback: string): string { return isHex(v) ? v.trim() : fallback; }
 
-// Approximate relative luminance — picks legible text/icon color over a given
-// background when there's no real extracted badge and we have to improvise with
-// the accent color.
+// Luminancia relativa aproximada — para elegir texto/ícono legible sobre un fondo dado
+// cuando no hay badge real extraído del KV y hay que improvisar con el color de acento.
 function contrastText(bgHex: string): string {
     const m = /^#([0-9a-fA-F]{6})$/.exec(bgHex);
     if (!m) return '#FFFFFF';
@@ -104,20 +97,20 @@ function contrastText(bgHex: string): string {
     return luminance > 0.55 ? '#111111' : '#FFFFFF';
 }
 
-// Real color of a zone in the reference image, read by code — never guessed by a
-// vision model. The caller already marked the exact rectangle of the badge on the
-// reference image when defining the zone; that pixel exists and can be read with
-// plain math (same bucket-quantization trick as dominantHexColors, but restricted
-// to the zone's crop instead of the full frame). Zero hallucination possible: it's
-// the color that's actually there.
-export async function sampleZoneDominantColor(referenceImageBase64: string, zone: ZoneBox): Promise<string | null> {
+// Color real de una zona del KV, leído por código — no adivinado por un modelo de visión.
+// El usuario ya marcó el rectángulo exacto del badge sobre el KV al definir la zona de
+// beneficio; ese pixel existe y se puede leer con matemática pura (mismo truco de
+// cuantización por buckets que dominantHexColors, pero restringido al recorte de la zona
+// en vez del frame completo). Cero alucinación posible: es el color que hay ahí, punto.
+export async function sampleZoneDominantColor(kvBase64: string, zone: ZoneBox): Promise<string | null> {
     try {
-        const buf = Buffer.from(referenceImageBase64, 'base64');
+        const buf = Buffer.from(kvBase64, 'base64');
         const meta = await sharp(buf).metadata();
         const w = meta.width || 0, h = meta.height || 0;
         if (!w || !h) return null;
-        // Inset 12% per side: if the user's rectangle isn't perfectly tight around the
-        // badge, this avoids sampling background/neighboring pixels right at the edge.
+        // Margen hacia adentro (12% por lado): si el rectángulo que marcó el usuario no
+        // quedó perfectamente ajustado al badge, evita leer píxeles del fondo/foto vecina
+        // que están justo en el borde de la zona marcada.
         const inset = 0.12;
         const zx = zone.x + zone.w * inset, zy = zone.y + zone.h * inset;
         const zw = zone.w * (1 - 2 * inset), zh = zone.h * (1 - 2 * inset);
@@ -145,15 +138,13 @@ export async function sampleZoneDominantColor(referenceImageBase64: string, zone
         const toHex = (v: number) => Math.round(v / dominant.count).toString(16).padStart(2, '0');
         return `#${toHex(dominant.r)}${toHex(dominant.g)}${toHex(dominant.b)}`;
     } catch (e: any) {
-        console.warn('[overlay] sampleZoneDominantColor failed (non-blocking, falling back to vision-extracted color):', e.message);
+        console.warn('[dcoOverlay] sampleZoneDominantColor falló (no bloqueante, se sigue con el color extraído por visión):', e.message);
         return null;
     }
 }
 
-// Picks the closest embedded font to the forensic descriptors of the identity
-// ("italic ultra-condensed Black" → Barlow Condensed BlackItalic, etc.). To bring
-// your own fonts, edit this map (and the font files under packages/server/fonts,
-// or point DCO_FONTS_DIR at your own folder — see fontSetup.ts).
+// Elige la fuente embebida que más se parece a los descriptores forenses de la
+// identidad ("italic ultra-condensed Black" → Barlow Condensed BlackItalic, etc.).
 function pickFont(t: any): { family: string; skewDeg: number } {
     const style  = String(t?.fontStyle  || '').toLowerCase();
     const width  = String(t?.fontWidth  || '').toLowerCase();
@@ -163,7 +154,7 @@ function pickFont(t: any): { family: string; skewDeg: number } {
     const heavy = /black|ultra|extra/.test(weight);
 
     if (condensed && heavy) {
-        // Barlow Condensed Black has a real italic; Anton doesn't (simulated with skew).
+        // Barlow Condensed Black tiene itálica real; Anton no (se simula con skew)
         return italic ? { family: 'Barlow Condensed', skewDeg: 0 } : { family: 'Anton', skewDeg: 0 };
     }
     if (condensed) return { family: 'Barlow Condensed', skewDeg: 0 };
@@ -171,8 +162,8 @@ function pickFont(t: any): { family: string; skewDeg: number } {
     return { family: 'Barlow', skewDeg: italic ? -8 : 0 };
 }
 
-// Derives the full layer style from an identity JSON (saved profile or
-// auto-extracted). Missing fields fall back to sane defaults.
+// Deriva el estilo completo de la capa desde el JSON de identidad (guardada o
+// auto-extraída). Campos ausentes caen a defaults dignos.
 export function deriveBrandLayerStyle(identity: any, sampledBenefitColor?: string | null): BrandLayerStyle {
     const s: BrandLayerStyle = { ...DEFAULT_STYLE };
     if (identity && typeof identity === 'object') {
@@ -194,19 +185,19 @@ export function deriveBrandLayerStyle(identity: any, sampledBenefitColor?: strin
     s.subheadFont = pickFont(sub).family;
     s.subheadFill = hex(sub.fillColor, s.subheadFill);
 
-    // If the identity analysis didn't detect any badge (common: the vision model
-    // doesn't always recognize bands/pills as a "badge"), don't fall back to
-    // DEFAULT_STYLE's generic black — use the brand's real accentColor (already
-    // extracted with higher confidence) as the bar background, so the worst case
-    // still reads as "on brand" instead of an unrelated black box.
+    // Si el análisis de identidad no detectó ningún badge en el KV (pasa seguido: el
+    // vision model no siempre reconoce bandas/pills como "badge"), NO caemos en el
+    // negro genérico de DEFAULT_STYLE — usamos el accentColor real de la marca (ya
+    // extraído con más confiabilidad) como fondo de la barra, para que en el peor
+    // caso el resultado se vea "de la marca" y no una caja negra sin relación.
     const badge = Array.isArray(identity.badges) && identity.badges.length ? identity.badges[0] : null;
-    if (!badge) console.warn('[overlay] identity has no detected badges — using accentColor as benefit-bar fallback instead of default black');
+    if (!badge) console.warn('[dcoOverlay] identity sin badges detectados — usando accentColor como fallback de barra de beneficio en vez del negro por defecto');
     s.benefitBarColor  = hex(badge?.bgColor, accent);
     const barIsAccent = s.benefitBarColor.toLowerCase() === accent.toLowerCase();
     s.benefitTextColor = hex(badge?.textColor, contrastText(s.benefitBarColor));
     s.benefitIconColor = barIsAccent ? contrastText(s.benefitBarColor) : accent;
-    // The real badge shape (extracted from the reference image) decides whether the
-    // pill gets a diagonal cut or stays a straight rectangle/pill.
+    // La forma real del badge (extraída del KV) decide si el pill lleva corte diagonal o
+    // es un rectángulo/pill recto — antes esta señal se extraía pero nunca se usaba.
     const badgeShape = String(badge?.shape || '').toLowerCase();
     if (badge && !/diagonal|banner|ribbon/.test(badgeShape)) s.benefitSkewDeg = 0;
 
@@ -220,14 +211,15 @@ export function deriveBrandLayerStyle(identity: any, sampledBenefitColor?: strin
     s.chipTextColor = hex(badge?.textColor, s.chipTextColor);
     }
 
-    // A color sampled from real pixels of the reference image (sampleZoneDominantColor)
-    // is more reliable than any hex guessed by the vision model or the fallback accent
-    // color — it's the actual pixel of the zone the caller marked. It always wins when
-    // present, whether or not an identity/badge was detected. A badge is not always a
-    // vivid color (e.g. it can legitimately be near-black) — don't discard a sample
-    // just because it comes out dark. The "+" icon still uses the brand accentColor
-    // unless the bar already IS that same accent, in which case it needs contrast
-    // instead (or the icon would be invisible against the bar).
+    // El color muestreado por píxeles reales del KV (sampleZoneDominantColor) es más
+    // confiable que cualquier hex adivinado por el modelo de visión o que el accentColor
+    // de respaldo — es el pixel real de la zona que el usuario marcó a mano. Gana siempre
+    // que exista, haya o no identidad/badge detectado. Verificado con el KV real de BOXER:
+    // el badge real ES negro (#0d0c0d) — un badge NO siempre es un color vívido, así que
+    // NO se descarta un muestreo solo por salir oscuro (eso fue un error: rechazaba
+    // exactamente el color correcto). El ícono "+" sigue siendo el accentColor de marca
+    // (amarillo en el KV real) salvo que el bar YA sea ese mismo accent (ahí sí hace
+    // falta contraste porque, si no, el ícono quedaría invisible sobre el bar).
     if (isHex(sampledBenefitColor)) {
         s.benefitBarColor = sampledBenefitColor;
         s.benefitTextColor = contrastText(sampledBenefitColor);
@@ -237,13 +229,13 @@ export function deriveBrandLayerStyle(identity: any, sampledBenefitColor?: strin
     return s;
 }
 
-// ─── Render helpers ─────────────────────────────────────────────────────────
+// ─── Helpers de render ─────────────────────────────────────────────────────────
 
 function escapeXml(str: string): string {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-// Heuristic word-wrap (doesn't measure real glyphs — uses a per-family width factor).
+// Word-wrap heurístico (no mide glyphs reales — factor por familia condensada/normal).
 function wrapText(text: string, maxWidthPx: number, fontSizePx: number, condensed: boolean): string[] {
     const avgCharWidth = fontSizePx * (condensed ? 0.44 : 0.56);
     const maxChars = Math.max(1, Math.floor(maxWidthPx / avgCharWidth));
@@ -259,7 +251,7 @@ function wrapText(text: string, maxWidthPx: number, fontSizePx: number, condense
     return lines;
 }
 
-// Auto-fit: shrinks the font until the wrapped block fits the available height/width.
+// Auto-fit: reduce la fuente hasta que el bloque envuelto entra en el alto disponible.
 function fitText(text: string, maxWidthPx: number, maxHeightPx: number, startFontSize: number, condensed: boolean, minFontSize = 9): { fontSize: number; lines: string[] } {
     let fontSize = startFontSize;
     let lines = wrapText(text, maxWidthPx, fontSize, condensed);
@@ -275,11 +267,11 @@ function fitText(text: string, maxWidthPx: number, maxHeightPx: number, startFon
 
 const CONDENSED_FAMILIES = new Set(['Anton', 'Barlow Condensed', 'Bebas Neue']);
 
-// Display text with layered outlines + shadow — the "designed" look of a real KV.
-// Layers (back to front): offset shadow → thick outer stroke → thin outline → fill.
-// skewX tilts the whole block.
+// Texto display con contornos en capas + sombra — el "look diseñado" del KV real.
+// Capas (de atrás hacia adelante): sombra desplazada → stroke exterior grueso →
+// outline fino → fill. skewX inclina el bloque completo.
 function displayText(opts: {
-    lines: string[]; fontSize: number; x: number; y: number; // y = baseline of first line
+    lines: string[]; fontSize: number; x: number; y: number; // y = baseline de la primera línea
     font: string; fill: string; stroke?: string | null; outline?: string | null;
     skewDeg?: number; anchor?: 'start' | 'middle'; letterSpacing?: number;
     shadow?: boolean; weight?: number;
@@ -303,11 +295,11 @@ function displayText(opts: {
     const inner = layers.join('');
     const skew = opts.skewDeg || 0;
     if (!skew) return inner;
-    // skew pivoted around the block's start so it doesn't shift position
+    // skew alrededor del inicio del bloque para que no se desplace
     return `<g transform="translate(${x.toFixed(1)},${y.toFixed(1)}) skewX(${skew}) translate(${(-x).toFixed(1)},${(-y).toFixed(1)})">${inner}</g>`;
 }
 
-// Parallelogram (slanted rect) — the bar behind benefit bullets.
+// Paralelogramo (rect inclinado) — la barra detrás de los bullets de beneficio.
 function slantedBar(x: number, y: number, w: number, h: number, skewDeg: number, fill: string, dx = 0, dy = 0): string {
     const skewPx = Math.tan((Math.abs(skewDeg) * Math.PI) / 180) * h;
     const dir = skewDeg <= 0 ? 1 : -1;
@@ -320,8 +312,8 @@ function slantedBar(x: number, y: number, w: number, h: number, skewDeg: number,
     return `<polygon points="${p}" fill="${fill}" />`;
 }
 
-// The "+" bullet icon — drawn as a shape (two rects), NEVER as a font glyph (glyphs
-// vary between fonts; the shape is always identical).
+// El ícono "+" de los bullets — dibujado como forma (dos rects), NUNCA como glyph
+// de fuente (los glyphs varían entre fuentes; la forma es idéntica siempre).
 function plusIcon(cx: number, cy: number, size: number, fill: string, shadow = true): string {
     const arm = size * 0.32;
     const full = size;
@@ -333,7 +325,7 @@ function plusIcon(cx: number, cy: number, size: number, fill: string, shadow = t
     <rect x="${(cx - full / 2).toFixed(1)}" y="${(cy - arm / 2).toFixed(1)}" width="${full.toFixed(1)}" height="${arm.toFixed(1)}" fill="${fill}"/>`;
 }
 
-// ─── Per-zone-type rendering ───────────────────────────────────────────────
+// ─── Render de cada tipo de zona ───────────────────────────────────────────────
 
 function renderZone(z: BrandTextZone, style: BrandLayerStyle, width: number, height: number): string {
     const px = (z.x / 100) * width, py = (z.y / 100) * height;
@@ -367,7 +359,7 @@ function renderZone(z: BrandTextZone, style: BrandLayerStyle, width: number, hei
             });
         }
         case 'benefit': {
-            // "+" icon + slanted bar + text.
+            // Ícono "+" + barra inclinada + texto — el sistema del KV de referencia.
             const iconSize = Math.min(ph * 0.85, pw * 0.16);
             const gap = iconSize * 0.28;
             const barX = px + iconSize + gap;
@@ -421,7 +413,7 @@ export function buildBrandLayerSvg(zones: BrandTextZone[], style: BrandLayerStyl
     return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">${parts}</svg>`;
 }
 
-// ─── Final composition ─────────────────────────────────────────────────────────
+// ─── Composición final ─────────────────────────────────────────────────────────
 
 export async function compositeBrandLayer(
     baseImageBase64: string,
@@ -448,7 +440,7 @@ export async function compositeBrandLayer(
                     .toBuffer();
                 composites.push({ input: resized, left: px, top: py });
             } catch (e: any) {
-                console.warn(`[overlay] Could not composite graphic zone "${gz.key}":`, e.message);
+                console.warn(`[dcoOverlay] No se pudo componer zona gráfica "${gz.key}":`, e.message);
             }
         }
 
@@ -462,12 +454,13 @@ export async function compositeBrandLayer(
         const outBuf = await img.png().toBuffer();
         return { base64: outBuf.toString('base64'), mime: 'image/png' };
     } catch (e: any) {
-        console.error('[overlay] Error compositing brand layer, returning original image:', e.message);
+        console.error('[dcoOverlay] Error componiendo capa de marca, devolviendo imagen original:', e.message);
         return { base64: baseImageBase64, mime: baseMime };
     }
 }
 
-// ─── Compat: flat zone shape for simple manual-overlay callers ────────────────
+// ─── Compat: firma anterior usada por código existente ────────────────────────
+// (routes viejas siguen llamando compositeManualOverlays con TextOverlayZone plano)
 export interface TextOverlayZone {
     key: string;
     text: string;
@@ -482,7 +475,7 @@ export interface TextOverlayZone {
 function kindFromKey(key: string): BrandZoneKind {
     if (key === 'headline') return 'headline';
     if (key === 'subhead') return 'subhead';
-    if (key === 'chip') return 'chip';
+    if (key === 'vitamina_chip' || key === 'chip') return 'chip';
     if (key === 'cta') return 'cta';
     return 'benefit';
 }

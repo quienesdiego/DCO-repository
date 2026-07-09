@@ -1,113 +1,86 @@
 # DCO Studio
 
-AI-powered ad-creative generation engine: from a single reference creative and
-a copy brief, produce on-brand static ad pieces (across all your standard ad
-formats), animated GIFs, video scripts, and narrative multi-slide carousels —
-with automatic QA and a deterministic, pixel-perfect text/logo layer.
+A **verbatim, byte-for-byte port** of MUSE's DCO (Dynamic Creative Optimization)
+module — the AI ad-creative generation engine (routes/dco.ts + its services)
+and its React frontend (DCOView.tsx), copied directly from production with
+zero rewriting of the actual generation logic.
 
-This is a **generic, provider-agnostic** extraction of a production DCO
-(Dynamic Creative Optimization) module: no hardcoded brand, client, product
-category, or vendor lock-in. You bring your own AI provider keys, your own
-database, and mount the frontend component inside your own app.
+> Earlier versions of this repo tried to genericize/adapt the code to a
+> provider-agnostic adapter layer. That port introduced real bugs (logo
+> compositing broke, generation produced garbage) because a 5,000+ line
+> pipeline was mechanically rewritten instead of copied. This version throws
+> that away and copies the original source files as-is — see
+> [`docs/NOTES.md`](docs/NOTES.md) for exactly what's verbatim vs. what
+> (minimally) had to change to make it a standalone repo.
 
-Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how the pipeline
-actually works (the "one painter, one compositor" split, the QA design, why
-brand identity is data and not code) before changing anything — the design
-choices there aren't arbitrary.
+## What's here
 
-Read [`docs/INTEGRATION.md`](docs/INTEGRATION.md) for how to plug in your own
-APIs/database/auth/frontend.
+```
+packages/server/
+  src/
+    routes/dco.ts              ← verbatim copy of backend/src/routes/dco.ts
+    services/dcoQa.ts          ← verbatim
+    services/dcoCharacters.ts  ← verbatim
+    services/dcoStories.ts     ← verbatim
+    services/dcoOverlay.ts     ← verbatim
+    services/fontSetup.ts      ← verbatim
+    services/supabase.ts       ← verbatim
+    index.ts                   ← NEW: minimal bootstrap (see docs/NOTES.md)
+  fonts/                       ← the embedded display fonts (Anton, Barlow…)
+  supabase-dco.sql             ← verbatim DB schema
+packages/client/
+  src/
+    DCOView.tsx                ← verbatim copy of views/DCOView.tsx
+    DemoApp.tsx                ← NEW: mounts <DCOView /> (it takes no props)
+```
 
-## What it does
-
-- **Learn a brand** from a batch of its approved reference creatives (colors,
-  typography, badge shapes, tone) — no manual design-system entry.
-- **Generate static creatives** across a full set of standard ad formats
-  (feed, story, banners…), with automatic multi-round QA (anatomy defects,
-  character consistency, brand-fidelity vs. creative-freshness balance) and a
-  code-rendered text/logo layer that's identical in quality on piece #1 and
-  piece #200.
-- **Generate copy** for new audiences from an existing spreadsheet brief, or
-  from scratch, with an automatically enforced length contract per format.
-- **Adapt an approved piece** to new formats/sizes (outpainting) while
-  preserving its text and logo.
-- **Build narrative carousels** (3–6 slides) with a consistent character
-  across slides.
-- **Produce a 3-clip video script** (with ready-to-paste prompts for
-  text-to-video models) from a finished static piece.
-- **Retouch** a generated piece with a plain-language correction instead of
-  regenerating from scratch.
-
-## Stack
-
-- **Server**: Node.js + TypeScript, [Hono](https://hono.dev), streaming SSE
-  for long-running generation jobs. See `packages/server`.
-- **Client**: a single React + TypeScript component
-  (`packages/client/src/DCOStudio.tsx`) you mount inside your existing app.
-- **Default AI providers**: Anthropic Claude (copy/reasoning) + Google Gemini
-  (image generation + multimodal QA) + optional OpenAI (`gpt-image-1`) as a
-  second image engine — all swappable, see below.
-- **Default persistence**: Supabase (Postgres + Storage) — swappable.
+Every file marked "verbatim" is byte-for-byte identical to the source —
+verified with SHA256 at copy time. Nothing about prompts, QA logic, overlay
+rendering, or the frontend UI was changed.
 
 ## Quick start
 
 ```bash
 npm install
-cp .env.example .env   # fill in your API keys — see below
+cp .env.example .env   # fill in your keys — see .env.example, names match the original exactly
 npm run dev:server      # http://localhost:3001
-npm run dev:client      # http://localhost:5173 — a minimal demo host app
+npm run dev:client       # http://localhost:5173
 ```
 
-Required for the default providers (see `.env.example` for the full list):
+Run `packages/server/supabase-dco.sql` once in your Supabase SQL editor, and
+create the two storage buckets it needs (`dco-characters`, `dco-stories`,
+both public-read) — the SQL file doesn't create buckets, same as the original.
 
-| Variable | What it's for |
-|---|---|
-| `ANTHROPIC_API_KEY` | copywriting / brief parsing / storyboards |
-| `GEMINI_API_KEY` | image generation + QA + brand-identity extraction |
-| `OPENAI_API_KEY` | optional second image engine |
-| `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` | brand profiles, characters, stories, feedback, file storage |
+## Before you integrate this into your platform, read this
 
-Run `packages/server/src/db/schema.sql` once in your Supabase project's SQL
-editor (creates tables + the two storage buckets it needs).
+Because this is a **verbatim** copy, it carries over things that only made
+sense inside MUSE and will need your attention:
 
-## Bring your own APIs
+1. **Hardcoded brand profile.** `routes/dco.ts` still contains
+   `BRAND_PROFILES.tarrito_rojo` (a real client's brand identity + ~45 scene
+   prompts) and product-category interaction rules for TVs/fridges/motorcycles
+   specific to that client. If your integration doesn't select that profile,
+   it's inert — but it's still in the file. There is also a `generic` /
+   learned-profile path (`POST /analyze-brand` → `dco_brand_profiles` table)
+   that works for any brand — **use that path**, not the hardcoded one.
+2. **`DCOView.tsx` is MUSE's actual UI**, in Spanish, with MUSE's red
+   (`#E30613`) hardcoded in dozens of inline styles, MUSE's production URL as
+   the fallback `BACKEND_URL`, and `localStorage.getItem('muse_user')` for the
+   logged-in user's email. None of that is parameterized. Point
+   `VITE_API_URL` at your backend and either accept MUSE's look-and-feel or
+   fork the component to restyle it.
+3. **Env var names match the original exactly** — see `.env.example`.
+4. See [`docs/NOTES.md`](docs/NOTES.md) for the full list of what's verbatim,
+   what changed and why, and known behaviors (e.g. `X-Muse-Key` auth is a
+   no-op unless `API_SECRET` is set — the frontend never sends that header).
 
-None of this is required. Every AI/storage dependency sits behind a small
-interface in `packages/server/src/adapters/types.ts`:
+## About your logo/garbage-output issue
 
-- `ImageProvider` — paints/edits the base photograph
-- `TextProvider` — copywriting, brief parsing, storyboards, QA verdicts, brand-identity extraction
-- `StorageProvider` — binary file storage
-- `DcoRepository` — brand profiles, characters, stories, feedback persistence
-
-Implement whichever ones you want to replace, wire them in
-`packages/server/src/index.ts`, and everything else — the prompt engineering,
-the QA logic, the deterministic overlay renderer — keeps working unchanged.
-Full guide: [`docs/INTEGRATION.md`](docs/INTEGRATION.md).
-
-## Repo layout
-
-```
-packages/
-  server/
-    src/
-      adapters/           # provider interfaces + default implementations
-        types.ts
-        providers/         # gemini.ts, anthropic.ts, openaiImage.ts, supabase.ts
-      services/            # overlay.ts, qa.ts, characters.ts, stories.ts, fontSetup.ts
-      routes/dco.ts         # HTTP/SSE API — createDcoRoutes(providers)
-      db/schema.sql         # default Supabase/Postgres schema
-      index.ts              # server entrypoint — wires default providers from env
-    fonts/                  # embedded display fonts used by the overlay renderer
-  client/
-    src/
-      DCOStudio.tsx          # the component you mount in your app
-      DemoApp.tsx            # minimal usage example
-docs/
-  ARCHITECTURE.md           # how the pipeline works and why
-  INTEGRATION.md            # how to swap providers / mount the client
-```
-
-## License
-
-Private. Not licensed for external use or redistribution.
+If pieces aren't respecting an uploaded logo or the output looks broken, that
+almost certainly traces back to the genericized code from the previous
+version of this repo, not this verbatim one. If it still happens on this
+version, it's a real bug (or a config/env issue) worth debugging directly
+against the original pipeline logic — see `services/dcoOverlay.ts`
+(`compositeBrandLayer`, called unconditionally at the end of `/generate` in
+`routes/dco.ts`) for exactly how the logo is composited, and check the server
+logs for `[dcoOverlay]` warnings.

@@ -1,31 +1,24 @@
 -- ============================================================================
--- DCO Studio — Supabase/Postgres schema (default DcoRepository implementation)
--- Run once in: Supabase → SQL Editor → New query → Run.
--- Brand identity lives 100% in data (dco_brand_profiles), never hardcoded —
--- that's what makes the engine reusable across brands/clients out of the box.
---
--- Using a different store? Implement the DcoRepository/StorageProvider
--- interfaces in packages/server/src/adapters/types.ts against your own
--- database instead — this file is only needed if you use the bundled
--- Supabase adapter (adapters/providers/supabase.ts).
+-- MUSE · DCO — Esquema Supabase (identidad 100% por marca, sin hardcode)
+-- Ejecutar UNA sola vez en:  Supabase → SQL Editor → New query → Run
+-- No depende de la función exec_sql (que no existe por defecto).
 -- ============================================================================
 
 create extension if not exists "pgcrypto";
 
 -- ────────────────────────────────────────────────────────────────────────────
--- 1) BRAND PROFILES — visual identity + QA rules + copy voice, all per-brand
---    (data, not code). This is what POST /analyze-brand learns from a batch
---    of a brand's reference creatives.
+-- 1) PERFILES DE MARCA — identidad visual + QA + copy, TODO por marca (data, no código)
+--    Aquí vive lo que aprende `analyze-brand` desde los KVs de cada marca.
 -- ────────────────────────────────────────────────────────────────────────────
 create table if not exists dco_brand_profiles (
     id               uuid primary key default gen_random_uuid(),
     name             text not null,
     color            text default '#6b7280',
     emoji            text default '🏷️',
-    identity_prompt  text not null,                 -- visual creative direction (image gen)
-    analysis_summary jsonb default '{}'::jsonb,      -- full output of /analyze-brand
-    qa_rules         jsonb default '[]'::jsonb,      -- brand-specific QA rules
-    copy_identity    jsonb default '{}'::jsonb,      -- tone, formula, do/don't words, audiences
+    identity_prompt  text not null,                 -- dirección creativa visual (image gen)
+    analysis_summary jsonb default '{}'::jsonb,      -- salida completa de analyze-brand
+    qa_rules         jsonb default '[]'::jsonb,      -- reglas QA PROPIAS de la marca (de-hardcode del QA)
+    copy_identity    jsonb default '{}'::jsonb,      -- tono, fórmula, palabras +/- , audiencias (de-hardcode del copy)
     kv_count         integer default 0,
     created_by       text default '',
     created_at       timestamptz default now(),
@@ -33,36 +26,37 @@ create table if not exists dco_brand_profiles (
 );
 create index if not exists idx_dco_profiles_created on dco_brand_profiles (created_at desc);
 
+-- Si la tabla ya existía sin estas columnas, las agrega sin perder datos:
+alter table dco_brand_profiles add column if not exists qa_rules      jsonb default '[]'::jsonb;
+alter table dco_brand_profiles add column if not exists copy_identity jsonb default '{}'::jsonb;
+alter table dco_brand_profiles add column if not exists updated_at    timestamptz default now();
+
 -- ────────────────────────────────────────────────────────────────────────────
--- 2) FEEDBACK — 👍/👎 on generated pieces, replayed as context in future
---    generations for the same brand/format family (continuous improvement).
+-- 2) FEEDBACK — calificación de piezas generadas (mejora continua)
 -- ────────────────────────────────────────────────────────────────────────────
 create table if not exists dco_feedback (
-    id             bigserial primary key,
-    created_at     timestamptz default now(),
-    profile_id     text,
-    format_id      text,
-    audience       text,
-    scene_desc     text,
-    headline       text,
-    rating         text,          -- 'good' | 'bad'
-    comment        text,
-    user_email     text,
-    chosen_version text            -- optional: which of N candidate versions was chosen
+    id          bigserial primary key,
+    created_at  timestamptz default now(),
+    profile_id  text,
+    format_id   text,
+    audience    text,
+    scene_desc  text,
+    headline    text,
+    rating      text,          -- 'good' | 'bad'
+    comment     text,
+    user_email  text
 );
 
 -- ────────────────────────────────────────────────────────────────────────────
--- 3) COPY BATCHES — optional: persisted output of the copywriting engine
---    (generate-copies / generate-copies-from-audiences), if you want to let
---    users revisit a previous batch instead of regenerating it. Not required
---    by the default DcoRepository interface; wire it up if you need it.
+-- 3) LOTES DE COPYS — cada cuadro de materiales generado por el motor de copys
+--    Guarda la identidad de copy inferida + las filas generadas (reutilizable).
 -- ────────────────────────────────────────────────────────────────────────────
 create table if not exists dco_copy_batches (
     id          uuid primary key default gen_random_uuid(),
-    profile_id  text,
+    profile_id  text,                          -- id de marca (uuid de dco_brand_profiles o built-in)
     brand_name  text,
-    identity    jsonb default '{}'::jsonb,
-    pieces      jsonb default '[]'::jsonb,
+    identity    jsonb default '{}'::jsonb,      -- identidad de copy inferida del cuadro base
+    pieces      jsonb default '[]'::jsonb,      -- filas del cuadro generado (DCO-compatibles)
     source_file text,
     created_by  text default '',
     created_at  timestamptz default now()
@@ -70,17 +64,18 @@ create table if not exists dco_copy_batches (
 create index if not exists idx_dco_batches_profile on dco_copy_batches (profile_id, created_at desc);
 
 -- ────────────────────────────────────────────────────────────────────────────
--- 4) CHARACTERS — reference photo for consistency across generations. No
---    face-embedding column: "same person" verification runs inside the single
---    QA model pass (see services/qa.ts), not an external face-recognition API.
+-- 4) PERSONAJES — foto de referencia para consistencia entre generaciones.
+--    Sin face_embedding: la verificación de "misma persona" corre dentro del
+--    mismo pase único de Gemini que ya hace el QA (ver dcoQa.ts) — no depende
+--    de ninguna API externa de reconocimiento facial.
 -- ────────────────────────────────────────────────────────────────────────────
 create table if not exists dco_characters (
     id                   uuid primary key default gen_random_uuid(),
     name                 text not null,
-    profile_id           text,                  -- optional brand id — null = available to all brands
+    profile_id           text,                  -- id de marca opcional (uuid o built-in) — null = disponible para todas
     reference_photo_url  text not null,
-    reference_photo_path text not null,         -- path within the bucket, so it can be deleted
-    physical_notes       text default '',
+    reference_photo_path text not null,         -- path dentro del bucket, para poder borrarla
+    physical_notes       text default '',        -- notas opcionales para reforzar la instrucción de identidad
     created_by           text default '',
     created_at           timestamptz default now(),
     updated_at           timestamptz default now()
@@ -88,8 +83,8 @@ create table if not exists dco_characters (
 create index if not exists idx_dco_characters_profile on dco_characters (profile_id, created_at desc);
 
 -- ────────────────────────────────────────────────────────────────────────────
--- 5) STORIES / CAROUSEL — multi-slide narrative with a consistent character,
---    ready to export in Meta/Instagram's exact carousel format.
+-- 5) HISTORIAS / CARRUSEL — narrativa multi-slide con un personaje consistente,
+--    lista para exportar en el formato exacto de carrusel de Meta/Instagram.
 -- ────────────────────────────────────────────────────────────────────────────
 create table if not exists dco_stories (
     id            uuid primary key default gen_random_uuid(),
@@ -122,20 +117,7 @@ create table if not exists dco_story_slides (
 create index if not exists idx_dco_story_slides_story on dco_story_slides (story_id, slide_index);
 
 -- ────────────────────────────────────────────────────────────────────────────
--- Storage buckets used by the default StorageProvider (adapters/providers/supabase.ts).
--- Public read so generated URLs can be embedded directly in the frontend/export files.
--- ────────────────────────────────────────────────────────────────────────────
-insert into storage.buckets (id, name, public)
-values ('dco-characters', 'dco-characters', true)
-on conflict (id) do nothing;
-
-insert into storage.buckets (id, name, public)
-values ('dco-stories', 'dco-stories', true)
-on conflict (id) do nothing;
-
--- ────────────────────────────────────────────────────────────────────────────
--- RLS: the backend uses the Supabase SERVICE ROLE key, which bypasses RLS
--- entirely — RLS is intentionally left off here to avoid accidental lockouts.
--- If you ever expose these tables to a client using the anon key, enable RLS
--- and add explicit policies first.
+-- RLS: el backend usa SUPABASE_SERVICE_ROLE_KEY, que IGNORA RLS (bypass total).
+-- Por eso NO activamos RLS aquí (evita bloqueos accidentales). Si algún día
+-- expones estas tablas al cliente con la anon key, activa RLS y agrega políticas.
 -- ────────────────────────────────────────────────────────────────────────────
